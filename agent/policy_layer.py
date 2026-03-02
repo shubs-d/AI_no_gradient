@@ -327,6 +327,7 @@ class SBCPolicy:
         precision_beta: float = 1.5,
         use_dcm: bool = True,
         clause_boost_scale: float = 1.0,
+        echo_copy_penalty: float = 0.35,
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         self.dirichlet_prior = dirichlet_prior
@@ -339,6 +340,7 @@ class SBCPolicy:
         self.precision_beta = precision_beta
         self.use_dcm = use_dcm
         self.clause_boost_scale = clause_boost_scale
+        self.echo_copy_penalty = echo_copy_penalty
         self.rng = rng or np.random.default_rng()
 
         # ── Bigram transition table ───────────────────────────────────
@@ -403,6 +405,7 @@ class SBCPolicy:
         role_boost_object: float = 1.5,
         clause_votes: Optional[np.ndarray] = None,
         clause_threshold: int = 15,
+        avoid_token_ids: Optional[Set[int]] = None,
     ) -> List[str]:
         """
         Generate a response via Bayesian-consistent pre-sampling modulation.
@@ -507,6 +510,16 @@ class SBCPolicy:
                 act_w = np.array([
                     activation_scores.get(c, 0.01) for c in candidates
                 ], dtype=np.float64)
+
+            # ── Step 4d: Echo-copy penalty (anti-question-mirroring) ─
+            # Penalise immediate reuse of user-input lexical nodes so
+            # generation moves toward learned answer templates.
+            if avoid_token_ids:
+                copy_g = np.ones(K, dtype=np.float64)
+                for i, cid in enumerate(candidates):
+                    if cid in avoid_token_ids:
+                        copy_g[i] = self.echo_copy_penalty
+                clause_g *= copy_g
 
             # ── Step 5: Precision-scaled pre-sampling modulation ─────
             alpha_final = precision_scaled_alpha(

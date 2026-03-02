@@ -90,6 +90,7 @@ class PolicyConfig:
     precision_beta: float = 1.5          # Global precision multiplier β
     use_dcm: bool = True                 # Use Pólya-urn (DCM) intra-utterance
     clause_boost_scale: float = 1.0      # Scale for exp(v_k/T) clause boost
+    echo_copy_penalty: float = 0.35      # Multiplicative penalty for echoing user tokens
 
 # ──────────────────────────────────────────────────────────────────────
 # 2. ACTIVE INFERENCE

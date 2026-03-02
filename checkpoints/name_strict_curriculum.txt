@@ -1,0 +1,14 @@
+question what is my name
+answer my name is shubham
+what is my name
+my name is shubham
+yes my name is shubham
+correct my name is shubham
+no that is wrong my name is shubham
+if asked what is my name answer my name is shubham
+when user says correct reinforce my name is shubham
+my name is shubham
+my name is shubham
+my name is shubham
+my name is shubham
+my name is shubham

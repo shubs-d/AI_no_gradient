@@ -72,6 +72,7 @@ class CognitiveAgent:
             precision_beta=cfg.policy.precision_beta,
             use_dcm=cfg.policy.use_dcm,
             clause_boost_scale=cfg.policy.clause_boost_scale,
+            echo_copy_penalty=cfg.policy.echo_copy_penalty,
             rng=rng,
         )
 
@@ -360,7 +361,17 @@ class CognitiveAgent:
             role_boost_object=grammar_cfg.role_boost_object,
             clause_votes=clause_votes_for_gen,
             clause_threshold=self.cfg.tsetlin.threshold,
+            avoid_token_ids=set(token_node_ids),
         )
+
+        # Identity-query retrieval override (count-based, no gradients):
+        # For prompts like "what is my name", retrieve the strongest
+        # learned continuation of the chain my→name→is→X from policy
+        # Dirichlet bigram counts.
+        if self._is_name_query(tokens):
+            retrieved = self._retrieve_name_statement(node_labels)
+            if retrieved is not None:
+                response_tokens = retrieved
 
         # Coherence fallback: if policy output is too short/repetitive,
         # synthesise a minimal grammatical response from learned triplets.
@@ -473,9 +484,67 @@ class CognitiveAgent:
         counts: Dict[str, int] = {}
         for tok in tokens:
             counts[tok] = counts.get(tok, 0) + 1
-        if max(counts.values()) / max(len(tokens), 1) > 0.22:
+        if max(counts.values()) / max(len(tokens), 1) > 0.60:
             return True
         return False
+
+    def _is_name_query(self, user_tokens: List[str]) -> bool:
+        """Detect identity queries such as 'what is my name'."""
+        tok = [t.lower() for t in user_tokens]
+        if "name" not in tok:
+            return False
+        if "what" in tok:
+            return True
+        if "who" in tok and "i" in tok:
+            return True
+        if "remember" in tok and "name" in tok:
+            return True
+        return False
+
+    def _retrieve_name_statement(
+        self,
+        node_labels: Dict[int, str],
+    ) -> Optional[List[str]]:
+        """
+        Retrieve the most likely learned identity phrase using the
+        bigram-count chain:  my → name → is → X.
+        """
+        my_id = self.memory.word_to_id("my")
+        name_id = self.memory.word_to_id("name")
+        is_id = self.memory.word_to_id("is")
+        if my_id is None or name_id is None or is_id is None:
+            return None
+
+        # Validate that my→name and name→is are supported by counts.
+        my_to_name = self.policy._get_count(my_id, name_id)
+        name_to_is = self.policy._get_count(name_id, is_id)
+        prior = self.policy.dirichlet_prior
+        if my_to_name <= prior * 2.0 or name_to_is <= prior * 2.0:
+            return None
+
+        # Find strongest continuation of is→X.
+        row = self.policy._bigram.get(is_id, {})
+        if not row:
+            return None
+
+        best_dst = None
+        best_count = -1.0
+        for dst, cnt in row.items():
+            label = node_labels.get(dst, "")
+            if label in {"<BOS>", "<EOS>", "<UNK>", "my", "name", "is"}:
+                continue
+            if cnt > best_count:
+                best_count = cnt
+                best_dst = dst
+
+        if best_dst is None or best_count <= prior * 2.0:
+            return None
+
+        name_token = node_labels.get(best_dst, "").strip()
+        if not name_token:
+            return None
+
+        return ["my", "name", "is", name_token]
 
     def _fallback_response_from_context(
         self,
