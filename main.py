@@ -34,6 +34,7 @@ from config import (
     ExperimentConfig,
 )
 from experiments.continual_learning_bench import run_benchmark, plot_results
+from persistence import save_agent_state, load_agent_state, restore_agent_state
 
 
 def parse_args() -> argparse.Namespace:

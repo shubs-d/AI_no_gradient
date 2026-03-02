@@ -69,6 +69,14 @@ if _PROJECT_ROOT not in sys.path:
 from config import Config
 from environment.chatbot_env import ChatbotEnv, tokenise, detokenise
 from agent.core_agent import CognitiveAgent
+from persistence import (
+    save_agent_state,
+    load_agent_state,
+    restore_agent_state,
+    checkpoint_exists,
+    checkpoint_summary,
+    DEFAULT_SAVE_PATH,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -222,6 +230,8 @@ def run_caregiver(
     seed: int = 42,
     save_plot: bool = False,
     plot_dir: str = "results",
+    save_path: str = DEFAULT_SAVE_PATH,
+    load_checkpoint: bool = False,
 ) -> dict:
     """
     Run the Automated Caregiver curriculum.
@@ -236,6 +246,12 @@ def run_caregiver(
         If True, save the VFE decay plot to *plot_dir*.
     plot_dir : str
         Directory for plots (created if absent).
+    save_path : str
+        File path for auto-save checkpoints (every 100 cycles).
+    load_checkpoint : bool
+        If True and a checkpoint exists at *save_path*, restore
+        the agent from its last saved state instead of starting
+        from a blank slate.
 
     Returns
     -------
@@ -252,6 +268,16 @@ def run_caregiver(
 
     env = ChatbotEnv(cfg.chat, rng)
     agent = CognitiveAgent(cfg, rng)
+
+    # ── Wake-up: optionally restore from checkpoint ───────────────────
+    if load_checkpoint and checkpoint_exists(save_path):
+        try:
+            cp = load_agent_state(save_path)
+            restore_agent_state(agent, env, checkpoint=cp)
+            print(f"  Resuming from checkpoint: {checkpoint_summary(save_path)}")
+        except Exception as exc:
+            print(f"  [warn] Could not load checkpoint: {exc}")
+            print("  Starting from blank slate.")
 
     # ── Metric accumulators ───────────────────────────────────────────
     vfe_log:     list[float] = []
@@ -321,6 +347,10 @@ def run_caregiver(
                 f"| {resp_str}"
             )
 
+        # ── Auto-save checkpoint every 100 cycles ─────────────────
+        if cycle % 100 == 0:
+            save_agent_state(agent, env, filepath=save_path)
+
         # ── Respawn energy if depleted (keep the loop going) ─────────
         # In the real chatbot the session would end, but for training
         # we reset homeostatic drives to keep the curriculum running.
@@ -339,6 +369,10 @@ def run_caregiver(
     print(f"  Graph nodes: {diag['num_memory_nodes']}  |  "
           f"Bigram entries: {diag['bigram_entries']}")
     print()
+
+    # ── Final save ────────────────────────────────────────────────────
+    final_path = save_agent_state(agent, env, filepath=save_path)
+    print(f"  Checkpoint saved → {final_path}")
 
     metrics = {
         "vfe": vfe_log,
@@ -433,14 +467,25 @@ def main() -> None:
                    help="Save VFE decay plot to results/")
     p.add_argument("--output", type=str, default="results",
                    help="Plot output directory (default: results)")
+    p.add_argument("--save", type=str, default=DEFAULT_SAVE_PATH,
+                   help=f"Checkpoint file path (default: {DEFAULT_SAVE_PATH})")
+    p.add_argument("--load", action="store_true",
+                   help="Resume from an existing checkpoint if available")
     args = p.parse_args()
 
-    run_caregiver(
-        total_cycles=args.cycles,
-        seed=args.seed,
-        save_plot=args.plot,
-        plot_dir=args.output,
-    )
+    try:
+        run_caregiver(
+            total_cycles=args.cycles,
+            seed=args.seed,
+            save_plot=args.plot,
+            plot_dir=args.output,
+            save_path=args.save,
+            load_checkpoint=args.load,
+        )
+    except KeyboardInterrupt:
+        # Ctrl-C during training: the last auto-save (every 100 cycles)
+        # has already captured most progress.  Print a friendly message.
+        print("\n  Interrupted — last auto-save checkpoint is preserved.")
 
 
 if __name__ == "__main__":
