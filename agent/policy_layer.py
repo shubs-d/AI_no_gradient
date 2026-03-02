@@ -57,6 +57,7 @@ Complexity
 
 from __future__ import annotations
 
+from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -69,6 +70,16 @@ import numpy as np
 EOS_TOKEN: str = "<EOS>"       # End-of-sentence marker
 BOS_TOKEN: str = "<BOS>"       # Beginning-of-sentence marker
 UNK_TOKEN: str = "<UNK>"       # Placeholder for truly unknown nodes
+
+# ── Refractory Period ─────────────────────────────────────────────────
+# Biological synapses have a ~1-3 ms refractory period during which
+# they cannot re-fire.  We mimic this by tracking the last N generated
+# node IDs and multiplying their Thompson-sample probability by a
+# severe suppression factor.  This prevents the pathological "looping"
+# behaviour (e.g., "good good good good") by forcing the agent to
+# traverse *different* edges in the lexical graph.
+REFRACTORY_WINDOW: int        = 3      # Track last 3 tokens
+REFRACTORY_SUPPRESSION: float = 0.01   # Multiply prob by 1% if refractory
 
 
 class SBCPolicy:
@@ -128,6 +139,13 @@ class SBCPolicy:
 
         # ── Last generated sequence (for feedback reinforcement) ──────
         self._last_bigrams: List[Tuple[int, int]] = []
+
+        # ── Refractory memory (Inhibition of Return) ─────────────────
+        # A sliding window of the last REFRACTORY_WINDOW node IDs that
+        # were selected during generation.  Any node still in this
+        # window receives a ×0.01 suppression on its Thompson-sampled
+        # probability, mimicking a synaptic refractory period.
+        self._refractory: deque = deque(maxlen=REFRACTORY_WINDOW)
 
     # ── Bigram access helpers ─────────────────────────────────────────
 
@@ -246,6 +264,19 @@ class SBCPolicy:
                 if w_sum > 1e-30:
                     theta /= w_sum
 
+            # ── Step 5b: Refractory suppression (Inhibition of Return) ─
+            # Any candidate that appears in the refractory memory has
+            # its sampled probability crushed by ×0.01.  This is the
+            # discrete analogue of a synaptic refractory period and
+            # breaks the pathological "good good good" looping.
+            for ri, cid in enumerate(candidates):
+                if cid in self._refractory:
+                    theta[ri] *= REFRACTORY_SUPPRESSION
+            # Re-normalise after suppression
+            r_sum = theta.sum()
+            if r_sum > 1e-30:
+                theta /= r_sum
+
             # ── Step 6: Select next word ──────────────────────────────
             next_idx = int(np.argmax(theta))
             next_id = candidates[next_idx]
@@ -275,7 +306,16 @@ class SBCPolicy:
 
             # Record bigram for later feedback
             self._last_bigrams.append((current_id, next_id))
+
+            # Push selected node into the refractory window so that
+            # the *next* token selection will suppress this word.
+            self._refractory.append(next_id)
+
             current_id = next_id
+
+        # Clear refractory memory between turns so the next response
+        # starts fresh (the inhibition is intra-utterance only).
+        self._refractory.clear()
 
         return tokens
 

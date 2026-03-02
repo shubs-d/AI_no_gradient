@@ -194,19 +194,44 @@ class ActiveInferenceEngine:
         obs_idx: int,
     ) -> None:
         """
-        Update Dirichlet counts with **forgetting**:
+        Update Dirichlet counts with **forgetting** and
+        **arousal-modulated plasticity**:
 
-            θ_{t+1}  =  ω · θ_t  +  η · χ_t
+            θ_{t+1}  =  ω · θ_t  +  η_eff · χ_t
 
         where χ_t is a one-hot evidence vector for the observed
-        transition, ω is the decay rate, and η is the learning rate.
+        transition, ω is the decay rate, and η_eff is the *dynamic*
+        learning rate.
 
-        This prevents the categorical distributions from becoming
-        permanently rigid due to historical count contamination.
+        Arousal-modulated plasticity (Psi-theory inspired)
+        ──────────────────────────────────────────────────
+        In biological cognition, high arousal / surprise amplifies
+        synaptic plasticity (Yerkes-Dodson law).  We model this by
+        scaling η with the current VFE prediction error:
+
+            η_eff = η_base · (1 + max(0, VFE − τ))
+
+        where τ = 3.0 is the surprise threshold.  When VFE > 3.0 the
+        agent's learning rate spikes, forcing rapid incorporation of
+        novel syntactic structures.  When VFE is low (agent predicts
+        well), η_eff ≈ η_base and learning is gentle.
+
+        No gradients — just a multiplicative scalar on integer counts.
         """
         omega = self.cfg.dirichlet_decay_omega    # 0.95
-        eta   = self.cfg.dirichlet_learning_rate  # 1.0
+        eta_base = self.cfg.dirichlet_learning_rate  # 1.0
         prior = self.cfg.dirichlet_prior
+
+        # ── Arousal-modulated learning rate ───────────────────────────
+        # Surprise threshold above which plasticity spikes.
+        AROUSAL_THRESHOLD = 3.0
+        # Clamp the multiplier to avoid runaway counts on extreme VFE.
+        MAX_AROUSAL_MULT  = 5.0
+        arousal_boost = min(
+            max(0.0, self.last_vfe - AROUSAL_THRESHOLD),
+            MAX_AROUSAL_MULT - 1.0,
+        )
+        eta = eta_base * (1.0 + arousal_boost)
 
         # ── Decay ALL counts toward the prior, then inject evidence ──
         # B[prev_state, action, :] *= ω  then += η at next_state
