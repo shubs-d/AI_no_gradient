@@ -71,13 +71,25 @@ class ChatConfig:
 
 @dataclass(frozen=True)
 class PolicyConfig:
-    """Parameters for the Dirichlet-based text generation policy."""
-    dirichlet_prior: float = 1.0         # Symmetric Dirichlet for bigrams
+    """Parameters for the Dirichlet-based text generation policy.
+
+    Key mathematical constraints (see dirichlet_diagnostics.py):
+      • α_prior = 0.2  (sub-Jeffreys: concentrates on sparse vertices)
+      • target_mass = 5.0  → ρ_H ≈ 0.74  (healthy entropy ratio)
+      • η/(1−ω) + α_prior = 21.2 ≫ 2·target_mass  (attractor reachable)
+      • precision_beta = 1.5  (mild sharpening pre-sampling)
+    """
+    dirichlet_prior: float = 0.2         # Sub-Jeffreys prior for K≈25
     max_response_len: int = 18           # Hard cap on generated tokens
-    eos_prior_boost: float = 0.9         # Lower EOS boost allows fuller replies
+    eos_prior_boost: float = 0.3         # Reduced — prevents premature stop
     policy_omega: float = 0.95           # Localised forgetting rate
     policy_eta: float = 1.0              # Learning rate for bigram counts
-    feedback_strength: float = 2.0       # Type-I / Type-II adjustment
+    feedback_strength: float = 3.0       # Shifts α by 60% of target_mass
+    # ── Precision & scaling (v4: systems-level fix) ────────────────
+    target_mass: float = 5.0             # M_target: total concentration after rescaling
+    precision_beta: float = 1.5          # Global precision multiplier β
+    use_dcm: bool = True                 # Use Pólya-urn (DCM) intra-utterance
+    clause_boost_scale: float = 1.0      # Scale for exp(v_k/T) clause boost
 
 # ──────────────────────────────────────────────────────────────────────
 # 2. ACTIVE INFERENCE

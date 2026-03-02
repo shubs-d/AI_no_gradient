@@ -102,6 +102,13 @@ from agent.memory_graph import (
     _is_likely_noun,
     _is_likely_verb,
 )
+from agent.dirichlet_diagnostics import (
+    precision_scaled_alpha,
+    dcm_predictive,
+    rescale_concentration,
+    normalised_entropy_ratio,
+    expected_thompson_gap,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -310,12 +317,16 @@ class SBCPolicy:
 
     def __init__(
         self,
-        dirichlet_prior: float = 1.0,
+        dirichlet_prior: float = 0.2,
         max_response_len: int = 30,
-        eos_prior_boost: float = 2.0,
+        eos_prior_boost: float = 0.3,
         omega: float = 0.95,
         eta: float = 1.0,
-        feedback_strength: float = 2.0,
+        feedback_strength: float = 3.0,
+        target_mass: float = 5.0,
+        precision_beta: float = 1.5,
+        use_dcm: bool = True,
+        clause_boost_scale: float = 1.0,
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         self.dirichlet_prior = dirichlet_prior
@@ -324,6 +335,10 @@ class SBCPolicy:
         self.omega = omega
         self.eta = eta
         self.feedback_strength = feedback_strength
+        self.target_mass = target_mass
+        self.precision_beta = precision_beta
+        self.use_dcm = use_dcm
+        self.clause_boost_scale = clause_boost_scale
         self.rng = rng or np.random.default_rng()
 
         # ── Bigram transition table ───────────────────────────────────
@@ -386,51 +401,49 @@ class SBCPolicy:
         role_boost_subject: float = 2.0,
         role_boost_predicate: float = 1.8,
         role_boost_object: float = 1.5,
+        clause_votes: Optional[np.ndarray] = None,
+        clause_threshold: int = 15,
     ) -> List[str]:
         """
-        Generate a response token sequence using Dirichlet Thompson
-        sampling restricted to the TopK active memory-graph nodes.
+        Generate a response via Bayesian-consistent pre-sampling modulation.
 
-        Algorithm
-        ---------
-        1.  Start from <BOS>.
-        2.  At each position, build the candidate set = TopK ∪ {<EOS>}.
-        3.  Construct the Dirichlet concentration vector α for the
-            current word over the candidates.
-        4.  Draw  θ ~ Dir(α)  — a Thompson sample.
-        5.  Optionally weight θ by activation scores (nodes with higher
-            spreading-activation contribute more).
-        5b. Apply refractory suppression (Inhibition of Return).
-        5c. Apply grammar-role boost: build syntactic features from
-            tokens generated so far, then boost candidates whose
-            grammatical role matches the predicted context slot.
-        6.  Select  w_next = argmax(θ · activation_weight).
-        7.  If w_next == <EOS>  or  length ≥ max_response_len, stop.
-        8.  Otherwise append w_next and repeat.
+        Revised algorithm (v4 — systems-level fix):
+        ─────────────────────────────────────────────
+        1. Start from <BOS>.
+        2. Build candidate set = TopK ∪ {<EOS>}.
+        3. Construct raw Dirichlet concentration α from bigram table.
+        4. Compute combined boost vector g_i:
+             g_i = grammar_boost_i · clause_boost_i · activation_i
+        5. Apply precision-scaled rescaling (ALL modulations pre-sampling):
+             α'_i = (α_i / α_0) · M_target · g_i · β
+        6. EITHER:
+           (a) Thompson sample:  θ ~ Dir(α'),  w = argmax θ
+           (b) DCM (Pólya urn):  P(w) = (α'_w + n_w) / (α'_0 + n_total)
+               where n_w counts intra-utterance selections of w
+        7. Apply refractory suppression (post-selection filter).
+        8. If w == <EOS> or length ≥ max_response_len, stop.
 
         Parameters
         ----------
         top_k_ids : List[int]
-            Node IDs of the K most-activated word nodes from the
-            memory graph (post spreading-activation).
+            Node IDs of the K most-activated word nodes.
         node_labels : Dict[int, str]
-            Mapping from node ID → word string (for all graph nodes).
+            Mapping from node ID → word string.
         activation_scores : Dict[int, float], optional
-            Mapping from node ID → activation level.  If provided,
-            Thompson-sampled probabilities are scaled by activation.
+            Node ID → activation level.
         grammar_boost : bool
-            If True, apply syntactic grammar-role boosting each step.
-        role_boost_subject, role_boost_predicate, role_boost_object : float
-            Multiplicative boosts for grammatical role matches.
+            Apply syntactic grammar-role boosting.
+        clause_votes : ndarray (K,), optional
+            Per-candidate Tsetlin Machine vote (integer, in [-T, T]).
+            If provided, converted to exp(v/T) boost on α.
+        clause_threshold : int
+            Tsetlin threshold T for normalising clause votes.
 
         Returns
         -------
         tokens : List[str]
-            Generated word tokens (excluding <BOS>/<EOS> markers).
         """
         if not top_k_ids:
-            # No activated nodes → agent has nothing to say.
-            # (The environment will penalise this via dark-room.)
             return []
 
         # Build candidate set: TopK word nodes + <EOS>
@@ -438,61 +451,33 @@ class SBCPolicy:
         if self.eos_id >= 0 and self.eos_id not in candidates:
             candidates.append(self.eos_id)
 
+        K = len(candidates)
+
+        # ── Pre-compute candidate → index mapping ────────────────────
+        cid_to_idx = {cid: i for i, cid in enumerate(candidates)}
+
         tokens: List[str] = []
         self._last_bigrams = []
         current_id = self.bos_id if self.bos_id >= 0 else candidates[0]
 
-        for _ in range(self.max_response_len):
-            # ── Step 3: Dirichlet concentration vector ────────────────
-            alpha = self._ensure_row(current_id, candidates)
+        # ── DCM intra-utterance counts (Pólya urn) ───────────────────
+        utterance_counts = np.zeros(K, dtype=np.float64)
 
-            # Boost <EOS> prior to prevent infinite generation
-            if self.eos_id >= 0 and self.eos_id in candidates:
-                eos_pos = candidates.index(self.eos_id)
-                alpha[eos_pos] += self.eos_prior_boost
+        # ── Last diagnostic snapshot ─────────────────────────────────
+        self._last_entropy_ratio: float = 1.0
+        self._last_thompson_gap: float = 0.0
 
-            # ── Step 4: Thompson sample  θ ~ Dir(α) ──────────────────
-            # Gamma-based sampling (standard Dirichlet procedure):
-            #   g_i ~ Gamma(α_i, 1);   θ_i = g_i / Σ g
-            # All discrete, no gradients.
-            gamma_samples = np.array([
-                self.rng.gamma(a) if a > 0 else 0.0
-                for a in alpha
-            ])
-            total = gamma_samples.sum()
-            if total < 1e-30:
-                theta = np.ones(len(candidates)) / len(candidates)
-            else:
-                theta = gamma_samples / total
+        for step in range(self.max_response_len):
+            # ── Step 3: Raw Dirichlet concentrations from bigram table ─
+            raw_alpha = self._ensure_row(current_id, candidates)
 
-            # ── Step 5: Modulate by activation scores ─────────────────
-            if activation_scores is not None:
-                act_weights = np.array([
-                    activation_scores.get(c, 0.01) for c in candidates
-                ])
-                # Softmax-free: just multiply and re-normalise
-                theta *= act_weights
-                w_sum = theta.sum()
-                if w_sum > 1e-30:
-                    theta /= w_sum
+            # Boost <EOS> prior
+            if self.eos_id >= 0 and self.eos_id in cid_to_idx:
+                eos_pos = cid_to_idx[self.eos_id]
+                raw_alpha[eos_pos] += self.eos_prior_boost
 
-            # ── Step 5b: Refractory suppression (Inhibition of Return) ─
-            # Any candidate that appears in the refractory memory has
-            # its sampled probability crushed by ×0.01.  This is the
-            # discrete analogue of a synaptic refractory period and
-            # breaks the pathological "good good good" looping.
-            for ri, cid in enumerate(candidates):
-                if cid in self._refractory:
-                    theta[ri] *= REFRACTORY_SUPPRESSION
-            # Re-normalise after suppression
-            r_sum = theta.sum()
-            if r_sum > 1e-30:
-                theta /= r_sum
-
-            # ── Step 5c: Grammar-role boost (syntactic guidance) ──────
-            # Build the 12-bit syntactic feature vector from what has
-            # been generated so far, then boost each candidate according
-            # to whether its POS matches the predicted context slot.
+            # ── Step 4a: Grammar boost vector ────────────────────────
+            grammar_g = np.ones(K, dtype=np.float64)
             if grammar_boost:
                 syn_feat = build_syntactic_features(tokens)
                 for gi, cid in enumerate(candidates):
@@ -500,58 +485,119 @@ class SBCPolicy:
                         continue
                     label_g = node_labels.get(cid, "")
                     if label_g and label_g not in (EOS_TOKEN, BOS_TOKEN, UNK_TOKEN):
-                        gb = grammar_role_boost(
+                        grammar_g[gi] = grammar_role_boost(
                             label_g, syn_feat,
                             role_boost_subject=role_boost_subject,
                             role_boost_predicate=role_boost_predicate,
                             role_boost_object=role_boost_object,
                         )
-                        theta[gi] *= gb
-                # Re-normalise after grammar boost
-                gb_sum = theta.sum()
-                if gb_sum > 1e-30:
-                    theta /= gb_sum
 
-            # ── Step 6: Select next word ──────────────────────────────
-            next_idx = int(np.argmax(theta))
+            # ── Step 4b: Clause boost vector ─────────────────────────
+            clause_g = np.ones(K, dtype=np.float64)
+            if clause_votes is not None and len(clause_votes) >= K:
+                # Convert integer votes [-T, T] to multiplicative boost
+                # exp(v_k / T) maps to [e^{-1}, e^{+1}] ≈ [0.37, 2.72]
+                T = max(clause_threshold, 1)
+                scaled = np.clip(clause_votes[:K], -T, T).astype(np.float64) / T
+                clause_g = np.exp(scaled * self.clause_boost_scale)
+
+            # ── Step 4c: Activation weight vector ────────────────────
+            act_w = None
+            if activation_scores is not None:
+                act_w = np.array([
+                    activation_scores.get(c, 0.01) for c in candidates
+                ], dtype=np.float64)
+
+            # ── Step 5: Precision-scaled pre-sampling modulation ─────
+            alpha_final = precision_scaled_alpha(
+                raw_alpha=raw_alpha,
+                target_mass=self.target_mass,
+                grammar_boost=grammar_g,
+                clause_boost=clause_g,
+                precision_beta=self.precision_beta,
+                activation_weights=act_w,
+                floor=0.01,
+            )
+
+            # ── Step 6: Sample next token ────────────────────────────
+            if self.use_dcm:
+                # DCM (Pólya urn): deterministic predictive + noise
+                probs = dcm_predictive(alpha_final, utterance_counts)
+            else:
+                # Thompson sampling: θ ~ Dir(α'), w = argmax θ
+                gamma_samples = self.rng.standard_gamma(alpha_final)
+                total = gamma_samples.sum()
+                if total < 1e-30:
+                    probs = np.ones(K) / K
+                else:
+                    probs = gamma_samples / total
+
+            # ── Step 6b: Refractory suppression ──────────────────────
+            for ri, cid in enumerate(candidates):
+                if cid in self._refractory:
+                    probs[ri] *= REFRACTORY_SUPPRESSION
+            r_sum = probs.sum()
+            if r_sum > 1e-30:
+                probs /= r_sum
+
+            # ── Step 6c: Select ──────────────────────────────────────
+            if self.use_dcm:
+                # Under DCM, add stochastic exploration via sampling
+                # from the predictive probabilities (not just argmax)
+                next_idx = int(self.rng.choice(K, p=probs))
+            else:
+                next_idx = int(np.argmax(probs))
+
             next_id = candidates[next_idx]
 
-            # ── Step 7: Check for <EOS> ───────────────────────────────
+            # ── Step 7: Check for <EOS> ──────────────────────────────
             if next_id == self.eos_id:
-                # Only accept EOS if we've generated at least 1 token
-                # (anti-dark-room: don't let the agent go silent easily)
                 if len(tokens) > 0:
                     break
                 else:
-                    # Force the agent to pick the second-best candidate
-                    theta[next_idx] = 0.0
-                    if theta.sum() < 1e-30:
-                        break  # truly no options
-                    theta /= theta.sum()
-                    next_idx = int(np.argmax(theta))
+                    # Force the agent to pick something else
+                    probs[next_idx] = 0.0
+                    r_sum = probs.sum()
+                    if r_sum < 1e-30:
+                        break
+                    probs /= r_sum
+                    if self.use_dcm:
+                        next_idx = int(self.rng.choice(K, p=probs))
+                    else:
+                        next_idx = int(np.argmax(probs))
                     next_id = candidates[next_idx]
                     if next_id == self.eos_id:
                         break
 
-            # ── Step 8: Append token ──────────────────────────────────
+            # ── Step 8: Append token ─────────────────────────────────
             label = node_labels.get(next_id, UNK_TOKEN)
-            # Skip special tokens in output
             if label not in (EOS_TOKEN, BOS_TOKEN, UNK_TOKEN):
                 tokens.append(label)
 
-            # Record bigram for later feedback
             self._last_bigrams.append((current_id, next_id))
 
-            # Push selected node into the refractory window so that
-            # the *next* token selection will suppress this word.
+            # Update DCM intra-utterance counts (Pólya urn memory)
+            utterance_counts[next_idx] += 1.0
+
+            # Push into refractory window
             self._refractory.append(next_id)
 
             current_id = next_id
 
-        # Clear refractory memory between turns so the next response
-        # starts fresh (the inhibition is intra-utterance only).
-        self._refractory.clear()
+        # ── Post-generation diagnostics ──────────────────────────────
+        if K > 1:
+            final_alpha = precision_scaled_alpha(
+                raw_alpha=self._ensure_row(current_id, candidates),
+                target_mass=self.target_mass,
+                grammar_boost=np.ones(K),
+                clause_boost=np.ones(K),
+                precision_beta=self.precision_beta,
+                floor=0.01,
+            )
+            self._last_entropy_ratio = normalised_entropy_ratio(final_alpha)
+            self._last_thompson_gap = expected_thompson_gap(final_alpha)
 
+        self._refractory.clear()
         return tokens
 
     # ── Caregiver feedback: Type-I (reinforce) / Type-II (punish) ─────

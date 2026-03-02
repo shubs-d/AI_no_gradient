@@ -68,6 +68,10 @@ class CognitiveAgent:
             omega=cfg.policy.policy_omega,
             eta=cfg.policy.policy_eta,
             feedback_strength=cfg.policy.feedback_strength,
+            target_mass=cfg.policy.target_mass,
+            precision_beta=cfg.policy.precision_beta,
+            use_dcm=cfg.policy.use_dcm,
+            clause_boost_scale=cfg.policy.clause_boost_scale,
             rng=rng,
         )
 
@@ -328,7 +332,24 @@ class CognitiveAgent:
         active_ids = self.memory.get_active_subgraph_ids()
         self.policy.apply_localised_forgetting(active_ids)
 
-        # Generate response via Thompson sampling over TopK
+        # ── 5b. Compute clause votes for candidate words ──────────
+        # Build binary features from the current memory graph state
+        # and get per-candidate TM votes to modulate Dirichlet alpha.
+        binary_features = self.memory.get_binary_features(
+            self.cfg.tsetlin.num_literals
+        )
+        clause_votes_raw = self.tsetlin.vote(binary_features)  # (A,)
+        # Expand to candidate-length (TopK + EOS): map action votes
+        # to word candidates by distributing the most relevant vote.
+        # Each candidate gets the max TM vote (action-agnostic boost).
+        clause_vote_best = int(clause_votes_raw.max())
+        clause_votes_for_gen = np.full(
+            len(top_k_ids) + 1,  # +1 for EOS
+            clause_vote_best,
+            dtype=np.float64,
+        )
+
+        # Generate response via precision-scaled Bayesian sampling
         response_tokens = self.policy.generate(
             top_k_ids=top_k_ids,
             node_labels=node_labels,
@@ -337,6 +358,8 @@ class CognitiveAgent:
             role_boost_subject=grammar_cfg.role_boost_subject,
             role_boost_predicate=grammar_cfg.role_boost_predicate,
             role_boost_object=grammar_cfg.role_boost_object,
+            clause_votes=clause_votes_for_gen,
+            clause_threshold=self.cfg.tsetlin.threshold,
         )
 
         # Coherence fallback: if policy output is too short/repetitive,
@@ -498,7 +521,8 @@ class CognitiveAgent:
 
     def get_diagnostics(self) -> Dict:
         """
-        Return a snapshot of the agent's internal complexity metrics.
+        Return a snapshot of the agent's internal complexity metrics,
+        including Dirichlet phase diagnostics (v4).
         """
         return {
             "num_memory_nodes": self.memory.num_nodes,
@@ -513,4 +537,11 @@ class CognitiveAgent:
             "tsetlin_int_ops": self.tsetlin.int_ops,
             "bigram_entries": self.policy.total_bigram_entries(),
             "triplet_count": self.memory.triplet_count,
+            # ── Dirichlet phase diagnostics (v4) ─────────────────────
+            "policy_entropy_ratio": getattr(
+                self.policy, '_last_entropy_ratio', 1.0
+            ),
+            "thompson_gap": getattr(
+                self.policy, '_last_thompson_gap', 0.0
+            ),
         }
