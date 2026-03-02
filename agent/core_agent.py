@@ -289,8 +289,20 @@ class CognitiveAgent:
 
         # Get TopK highest-activated nodes = contextual comprehension
         top_k_pairs = self.memory.get_contextual_top_k(k=chat_cfg.top_k)
-        top_k_ids = [nid for nid, _ in top_k_pairs]
-        activation_scores = {nid: act for nid, act in top_k_pairs}
+        node_labels = self.memory.get_all_labels()
+        # Filter out non-lexical scaffold nodes from language generation.
+        top_k_ids = []
+        activation_scores = {}
+        for nid, act in top_k_pairs:
+            lbl = node_labels.get(nid, "")
+            if not lbl:
+                continue
+            if lbl in {BOS_TOKEN, EOS_TOKEN, "<UNK>"}:
+                continue
+            if lbl.startswith("obs_"):
+                continue
+            top_k_ids.append(nid)
+            activation_scores[nid] = act
 
         # ── 4. BME: handle unknown words ─────────────────────────────
         if unknown:
@@ -317,7 +329,6 @@ class CognitiveAgent:
         self.policy.apply_localised_forgetting(active_ids)
 
         # Generate response via Thompson sampling over TopK
-        node_labels = self.memory.get_all_labels()
         response_tokens = self.policy.generate(
             top_k_ids=top_k_ids,
             node_labels=node_labels,
@@ -327,6 +338,15 @@ class CognitiveAgent:
             role_boost_predicate=grammar_cfg.role_boost_predicate,
             role_boost_object=grammar_cfg.role_boost_object,
         )
+
+        # Coherence fallback: if policy output is too short/repetitive,
+        # synthesise a minimal grammatical response from learned triplets.
+        if self._is_low_quality_response(response_tokens):
+            response_tokens = self._fallback_response_from_context(
+                triplet_ids=triplet_ids,
+                top_k_ids=top_k_ids,
+                node_labels=node_labels,
+            )
 
         # ── 6. LEARN: update Dirichlet counts ────────────────────────
         cur_state = self.inference.most_likely_state()
@@ -410,6 +430,69 @@ class CognitiveAgent:
         self._last_obs_idx = obs_idx
 
         return response_tokens, vfe
+
+    def _is_low_quality_response(self, tokens: List[str]) -> bool:
+        """Heuristic gate for degenerate outputs (empty/short/repetitive)."""
+        if not tokens:
+            return True
+        if len(tokens) < 2:
+            return True
+        uniq = len(set(tokens))
+        # Low lexical diversity indicates looping / babbling.
+        if uniq <= 1:
+            return True
+        diversity = uniq / max(len(tokens), 1)
+        if diversity < 0.55:
+            return True
+        if len(tokens) >= 8 and diversity < 0.70:
+            return True
+        # If one token dominates the utterance, treat as babbling.
+        counts: Dict[str, int] = {}
+        for tok in tokens:
+            counts[tok] = counts.get(tok, 0) + 1
+        if max(counts.values()) / max(len(tokens), 1) > 0.22:
+            return True
+        return False
+
+    def _fallback_response_from_context(
+        self,
+        triplet_ids: List[Tuple[int, int, int]],
+        top_k_ids: List[int],
+        node_labels: Dict[int, str],
+    ) -> List[str]:
+        """
+        Build a concise, grammatical fallback response from semantic
+        triplets first, then from active lexical context if no triplet
+        is available.
+        """
+        special = {BOS_TOKEN, EOS_TOKEN, "<UNK>"}
+
+        if triplet_ids:
+            s_id, p_id, o_id = triplet_ids[-1]
+            s = node_labels.get(s_id, "")
+            p = node_labels.get(p_id, "")
+            o = node_labels.get(o_id, "")
+            toks = [t for t in [s, p, o] if t and t not in special]
+            if len(toks) >= 2:
+                return toks
+
+        # Top-k lexical fallback
+        out: List[str] = []
+        for nid in top_k_ids:
+            w = node_labels.get(nid, "")
+            if not w or w in special:
+                continue
+            if w in out:
+                continue
+            out.append(w)
+            if len(out) >= 4:
+                break
+
+        if len(out) >= 2:
+            return out
+        if out:
+            return ["i", "understand", out[0]]
+        return ["i", "am", "listening"]
 
     # ── Diagnostics ───────────────────────────────────────────────────
 

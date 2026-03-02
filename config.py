@@ -61,9 +61,9 @@ class ChatConfig:
     dark_room_penalty: float = 40.0      # Penalty for silence / repetition
     repeat_tolerance: int = 3            # Consecutive identical replies
     num_obs_buckets: int = 64            # Hash buckets for obs index
-    top_k: int = 15                      # TopK nodes for comprehension
+    top_k: int = 25                      # TopK nodes for comprehension
     activation_spike_strength: float = 2.0  # Injection strength per token
-    cooccurrence_window: int = 2         # Bigram/trigram window for edges
+    cooccurrence_window: int = 3         # Bigram/trigram window for edges
 
 # ──────────────────────────────────────────────────────────────────────
 # 1c. POLICY LAYER — Sparse Bayesian Competitive Policy
@@ -73,8 +73,8 @@ class ChatConfig:
 class PolicyConfig:
     """Parameters for the Dirichlet-based text generation policy."""
     dirichlet_prior: float = 1.0         # Symmetric Dirichlet for bigrams
-    max_response_len: int = 25           # Hard cap on generated tokens
-    eos_prior_boost: float = 1.5         # EOS prior mass encourages brevity
+    max_response_len: int = 18           # Hard cap on generated tokens
+    eos_prior_boost: float = 0.9         # Lower EOS boost allows fuller replies
     policy_omega: float = 0.95           # Localised forgetting rate
     policy_eta: float = 1.0              # Learning rate for bigram counts
     feedback_strength: float = 2.0       # Type-I / Type-II adjustment
@@ -136,9 +136,9 @@ class TsetlinConfig:
 @dataclass(frozen=True)
 class StructureConfig:
     """Parameters for two-timescale expansion and MDL pruning."""
-    vfe_expansion_tau: float = 0.05      # τ near-zero → BME OVERDRIVE
-    rolling_window_T: int = 10           # Shorter window → faster triggering
-    expansion_cooldown: int = 5          # Min steps between consecutive BME
+    vfe_expansion_tau: float = 4.0       # Higher τ avoids noisy over-expansion
+    rolling_window_T: int = 30           # Smoother surprise integration window
+    expansion_cooldown: int = 15         # Min steps between consecutive BME
     max_ai_states: int = 48              # Cap AI hidden-state dimension
     mdl_eval_interval: int = 100         # Steps between BMR pruning sweeps
     mdl_enabled: bool = True             # ★ MDL ENABLED for v3 scaling
