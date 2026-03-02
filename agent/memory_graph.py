@@ -4,10 +4,21 @@ memory_graph.py
 Spreading-activation episodic/semantic memory network implemented as a
 dynamic directed graph with **strict Lyapunov stability guarantees**.
 
+NLP Chatbot Extension (v2)
+──────────────────────────
+Each node now represents a **distinct word or concept** (lexical node).
+When a user message is tokenised, the corresponding word nodes receive
+an *activation spike*.  Spreading activation then propagates semantic
+associations through co-occurrence edges, and the TopK highest-activated
+nodes represent the agent's *contextual comprehension* of the user's
+prompt.
+
 Graph representation
 ────────────────────
 • Nodes are identified by integer IDs  0 … N−1.
-• Each node carries a real-valued *activation*  A_i(t).
+• Each node carries:
+    - A real-valued *activation*  A_i(t).
+    - A string *label*  (the word or concept it represents).
 • Directed edges carry **integer** co-occurrence counts; the normalised
   adjacency matrix  W  is derived from these counts on-the-fly.
 
@@ -51,6 +62,10 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
+
+# Optional is used for word_to_id return type;
+# Set is used for get_active_subgraph_ids return type;
+# Tuple is used for get_contextual_top_k return type.
 
 from config import MemoryConfig
 
@@ -338,3 +353,142 @@ class MemoryGraph:
         if norms < 1e-12:
             return 0.0
         return float(dot / norms)
+
+    # ══════════════════════════════════════════════════════════════════
+    # NLP / Chatbot extensions  (v2)
+    # ══════════════════════════════════════════════════════════════════
+
+    # ── Word-to-node registry ─────────────────────────────────────────
+
+    def get_or_create_word_node(self, word: str) -> int:
+        """
+        Return the node ID for *word*, creating a new node if the word
+        has never been seen.
+
+        This is the primary interface for grounding tokens in the graph.
+        Returns (node_id, is_new) would be useful but for API compat
+        we just return the id; callers can check num_nodes before/after.
+
+        Parameters
+        ----------
+        word : str
+            Lowercased word token.
+
+        Returns
+        -------
+        node_id : int
+        """
+        # Linear scan of labels — fine for vocabularies < 10 000.
+        for nid in range(self._num_nodes):
+            if self._labels.get(nid) == word:
+                return nid
+        # Not found → allocate a new lexical node
+        return self.add_node(label=word)
+
+    def word_to_id(self, word: str) -> Optional[int]:
+        """
+        Look up *word* in the label registry.  Returns None if absent.
+        Pure query — does NOT create a new node.
+        """
+        for nid in range(self._num_nodes):
+            if self._labels.get(nid) == word:
+                return nid
+        return None
+
+    def get_label(self, node_id: int) -> str:
+        """Return the string label of a node (word or concept)."""
+        return self._labels.get(node_id, f"n{node_id}")
+
+    def get_all_labels(self) -> Dict[int, str]:
+        """Return the full {node_id: label} dictionary."""
+        return dict(self._labels)
+
+    # ── Token-based activation spike ──────────────────────────────────
+
+    def inject_token_activations(
+        self,
+        token_node_ids: List[int],
+        strength: float = 2.0,
+    ) -> None:
+        """
+        Inject activation spikes on the nodes corresponding to the
+        tokens in a user message.  This is the sensory grounding step
+        for NLP: the user's words light up their lexical nodes.
+
+        After this call, ``step()`` will propagate activation through
+        co-occurrence edges (spreading activation), so semantically
+        related words also become active.
+
+        Parameters
+        ----------
+        token_node_ids : List[int]
+            Ordered list of node IDs from the tokenised user message.
+        strength : float
+            Activation injected per token occurrence.
+        """
+        for nid in token_node_ids:
+            self.inject_observation(nid, strength=strength)
+
+    # ── Hebbian co-occurrence from token sequences ────────────────────
+
+    def learn_cooccurrences(
+        self,
+        token_node_ids: List[int],
+        window: int = 2,
+    ) -> None:
+        """
+        Strengthen edges between co-occurring words in a token sequence.
+
+        For each pair of tokens within a sliding window of size *window*,
+        the directed edge count is incremented (Hebbian learning).
+        This builds the co-occurrence structure that spreading activation
+        will later traverse.
+
+        Parameters
+        ----------
+        token_node_ids : List[int]
+            Ordered node IDs from the tokenised message.
+        window : int
+            Context window radius.  Default 2 means we link each word
+            to its 2 neighbours on each side.
+        """
+        n_tokens = len(token_node_ids)
+        for i in range(n_tokens):
+            for j in range(max(0, i - window), min(n_tokens, i + window + 1)):
+                if i != j:
+                    self.strengthen_edge(token_node_ids[i], token_node_ids[j])
+
+    # ── TopK contextual comprehension ─────────────────────────────────
+
+    def get_contextual_top_k(self, k: int = 10) -> List[Tuple[int, float]]:
+        """
+        Return the TopK highest-activated nodes with their activation
+        scores.  This represents the agent's *contextual comprehension*
+        of the current conversational state after spreading activation.
+
+        Returns
+        -------
+        List of (node_id, activation) tuples, sorted descending.
+        """
+        ids = self.top_k_active(k)
+        return [(nid, float(self._activation[nid])) for nid in ids]
+
+    def get_active_subgraph_ids(self, threshold: Optional[float] = None) -> Set[int]:
+        """
+        Return the set of node IDs whose activation exceeds *threshold*.
+
+        Used by the policy layer for localised Dirichlet forgetting —
+        only rows in the active sub-graph receive ω-decay.
+
+        Parameters
+        ----------
+        threshold : float, optional
+            Defaults to ``cfg.activation_threshold``.
+        """
+        if threshold is None:
+            threshold = self.cfg.activation_threshold
+        n = self._num_nodes
+        if n == 0:
+            return set()
+        active_mask = self._activation[:n] >= threshold
+        return set(int(i) for i in np.where(active_mask)[0])

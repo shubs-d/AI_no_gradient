@@ -9,6 +9,16 @@ Two-timescale structural adaptation:
     when accumulated surprise warrants it; Bayesian Model Reduction (BMR)
     prunes dead-weight via the Minimum Description Length (MDL) principle.
 
+NLP Chatbot Extension (v2)
+──────────────────────────
+  • **Unknown-word BME** — When the user inputs a completely unrecognised
+    word, VFE spikes.  The structure learner detects this and dynamically
+    allocates a new Node in the memory graph for the unknown word,
+    linking it to the current conversational context.
+  • **Localised forgetting** — The Dirichlet forgetting rate (ω = 0.95)
+    is applied only to the active sub-graph so the agent can adapt to
+    new topics without catastrophic forgetting of basic grammar.
+
 Bayesian Model Expansion (BME)
 ──────────────────────────────
 Expansion is NOT triggered on every high-surprise observation.  Instead
@@ -178,6 +188,80 @@ class StructureLearner:
         return report
 
     # ── Complexity metrics ────────────────────────────────────────────
+
+    # ── Unknown-word BME (NLP Chatbot v2) ─────────────────────────────
+
+    def handle_unknown_words(
+        self,
+        unknown_words: List[str],
+        memory_graph,                  # MemoryGraph  (avoid circular import)
+        current_context_ids: List[int],
+        inference_engine=None,         # ActiveInferenceEngine
+    ) -> List[int]:
+        """
+        Bayesian Model Expansion triggered by unrecognised vocabulary.
+
+        When the user inputs words that have no existing node in the
+        memory graph, the VFE prediction error will spike.  This method
+        handles the structural response:
+
+        1.  Allocate a **new Node** in the memory graph for each
+            unknown word.
+        2.  Link the new node to the current conversational context
+            (the last few active nodes) with initial co-occurrence edges.
+        3.  If an Active Inference engine is provided, expand its state
+            space to accommodate the new structure.
+
+        Parameters
+        ----------
+        unknown_words : List[str]
+            Words not yet in the memory graph.
+        memory_graph : MemoryGraph
+            The agent's spreading-activation memory graph.
+        current_context_ids : List[int]
+            Node IDs of the currently active conversational context
+            (e.g., nodes from the most recent user tokens).
+        inference_engine : ActiveInferenceEngine, optional
+            If provided, state space is expanded in parallel.
+
+        Returns
+        -------
+        new_node_ids : List[int]
+            IDs of the newly allocated nodes.
+        """
+        new_ids: List[int] = []
+
+        for word in unknown_words:
+            # Respect cooldown to avoid quadratic blowup
+            if self._steps_since_expansion < self.cfg.expansion_cooldown:
+                break
+
+            # Allocate new lexical node
+            nid = memory_graph.get_or_create_word_node(word)
+            new_ids.append(nid)
+
+            # Link to current conversational context
+            for ctx_id in current_context_ids[-5:]:
+                # Bidirectional co-occurrence edges
+                memory_graph.strengthen_edge(ctx_id, nid)
+                memory_graph.strengthen_edge(nid, ctx_id)
+
+            # Reset accumulator for this expansion event
+            self._vfe_window.clear()
+            self._steps_since_expansion = 0
+
+        # Expand AI state space if needed
+        if inference_engine is not None and new_ids:
+            max_states = self.cfg.max_ai_states
+            if inference_engine.num_states < max_states:
+                target = min(
+                    max(inference_engine.num_states + len(new_ids),
+                        memory_graph.num_nodes),
+                    max_states,
+                )
+                inference_engine.expand_state_space(target)
+
+        return new_ids
 
     @staticmethod
     def model_description_length(memory_graph, tsetlin) -> float:

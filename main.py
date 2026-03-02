@@ -25,6 +25,8 @@ if _PROJECT_ROOT not in sys.path:
 from config import (
     Config,
     GridConfig,
+    ChatConfig,
+    PolicyConfig,
     InferenceConfig,
     MemoryConfig,
     TsetlinConfig,

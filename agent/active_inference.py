@@ -48,6 +48,8 @@ All arrays are integer counts updated via the forgetting equation.
 
 from __future__ import annotations
 
+from typing import Optional, Set
+
 import numpy as np
 from scipy.special import digamma
 
@@ -342,3 +344,149 @@ class ActiveInferenceEngine:
     def most_likely_state(self) -> int:
         """MAP estimate of the current hidden state."""
         return int(np.argmax(self._qs))
+
+    # ═══════════════════════════════════════════════════════════════════
+    # NLP / Chatbot extensions  (v2)
+    # ═══════════════════════════════════════════════════════════════════
+
+    # ── Caregiver feedback (Social Active Inference) ─────────────────
+
+    def apply_social_feedback(
+        self,
+        sentiment: int,
+        current_state: int,
+        obs_idx: int,
+        strength: float = 2.0,
+    ) -> None:
+        """
+        Integrate caregiver feedback into the Dirichlet count tables.
+
+        This implements the *Social Active Inference* loop:
+        - Positive sentiment (“Good”, “Yes”) → Type-I reinforcement:
+          strengthen the A[state, obs] count so the agent learns that
+          producing this type of response in this state is desirable.
+        - Negative sentiment (“No”, “Bad”) → Type-II correction:
+          mildly weaken the A[state, obs] count.
+
+        Parameters
+        ----------
+        sentiment : int
+            +1 = positive, −1 = negative, 0 = neutral (no-op).
+        current_state : int
+            MAP hidden state at the time of feedback.
+        obs_idx : int
+            Observation index at the time of feedback.
+        strength : float
+            Magnitude of the count adjustment.
+        """
+        if sentiment == 0:
+            return
+        if current_state < 0 or current_state >= self.num_states:
+            return
+        obs_idx = obs_idx % self.num_obs
+
+        if sentiment > 0:
+            # Type I: reinforce  A[state, obs]
+            self._A[current_state, obs_idx] += strength
+        else:
+            # Type II: weaken (floored at prior)
+            prior = self.cfg.dirichlet_prior
+            self._A[current_state, obs_idx] = max(
+                self._A[current_state, obs_idx] - strength * 0.5,
+                prior,
+            )
+
+    # ── Localised Dirichlet forgetting ───────────────────────────────
+
+    def apply_localised_forgetting(
+        self,
+        active_states: Optional[Set[int]] = None,
+    ) -> None:
+        """
+        Apply Dirichlet decay ω **only** to the rows of A and B that
+        correspond to the currently active hidden states.
+
+        This prevents catastrophic forgetting of grammatical knowledge
+        encoded in inactive states while allowing topic-specific counts
+        to decay when the conversation shifts.
+
+        Mathematical formulation
+        ───────────────────────
+        For each active state s ∈ active_states:
+            A[s, :] ← ω · A[s, :]
+            B[s, a, :] ← ω · B[s, a, :]   ∀ a
+
+        Inactive states retain their full count tables.
+
+        Parameters
+        ----------
+        active_states : Set[int], optional
+            Hidden-state indices to decay.  If None, decay ALL
+            (falls back to the original global forgetting behaviour).
+        """
+        omega = self.cfg.dirichlet_decay_omega
+        prior = self.cfg.dirichlet_prior
+
+        if active_states is None:
+            # Global decay (fallback)
+            states_to_decay = range(self.num_states)
+        else:
+            states_to_decay = [
+                s for s in active_states if 0 <= s < self.num_states
+            ]
+
+        for s in states_to_decay:
+            # Decay A[s, :]
+            self._A[s, :] *= omega
+            np.maximum(self._A[s, :], prior, out=self._A[s, :])
+            # Decay B[s, a, :] for all actions
+            for a in range(self.num_actions):
+                self._B[s, a, :] *= omega
+                np.maximum(self._B[s, a, :], prior, out=self._B[s, a, :])
+
+    # ── Unknown-word surprise detection ─────────────────────────────
+
+    def compute_novelty_surprise(self, obs_idx: int) -> float:
+        """
+        Compute the VFE prediction error for a single observation.
+
+        When the user inputs a completely unrecognised word, the hash-
+        based obs_idx will map to a rarely-seen observation bucket,
+        causing a large surprise spike.  This value is consumed by the
+        structure learner to decide whether BME should fire.
+
+        Returns
+        -------
+        surprise : float
+            − ln P(o)  marginalised over states.
+        """
+        return self.get_surprise(obs_idx)
+
+    # ── Dynamically grow obs space for chatbot mode ─────────────────
+
+    def expand_obs_space(self, new_num_obs: int) -> None:
+        """
+        Grow the A matrix when the observation space increases
+        (e.g., more hash buckets needed for a larger vocabulary).
+
+        New columns are initialised to the symmetric prior.
+
+        Parameters
+        ----------
+        new_num_obs : int
+            Target observation dimension.
+        """
+        if new_num_obs <= self.num_obs:
+            return
+        delta = new_num_obs - self.num_obs
+        prior = self.cfg.dirichlet_prior
+        new_cols = np.full(
+            (self.num_states, delta), prior, dtype=np.float64
+        )
+        self._A = np.concatenate([self._A, new_cols], axis=1)
+
+        # Extend preference vector C with zeros (neutral)
+        new_C = np.zeros(delta, dtype=np.float64)
+        self._C = np.concatenate([self._C, new_C])
+
+        self.num_obs = new_num_obs

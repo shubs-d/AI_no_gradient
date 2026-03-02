@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Tuple
 
 # ──────────────────────────────────────────────────────────────────────
-# 1. ENVIRONMENT
+# 1a. ENVIRONMENT — Grid World (legacy, preserved for benchmarks)
 # ──────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -43,6 +43,41 @@ ACTION_DOWN: int    = 1
 ACTION_LEFT: int    = 2
 ACTION_RIGHT: int   = 3
 NUM_ACTIONS: int    = 4
+
+# ──────────────────────────────────────────────────────────────────────
+# 1b. ENVIRONMENT — Chatbot  (replaces grid world for NLP pivot)
+# ──────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ChatConfig:
+    """Parameters for the conversational chatbot environment."""
+    initial_energy: int = 100            # Agent starting energy
+    initial_affiliation: float = 50.0    # Social bonding drive
+    energy_cost_per_turn: int = 2        # Passive drain each turn
+    energy_gain_positive: int = 15       # Energy from positive feedback
+    energy_loss_negative: int = 10       # Energy penalty for negative feedback
+    affiliation_gain: float = 5.0        # Affiliation bump from positive
+    affiliation_decay: float = 0.98      # Per-turn multiplicative decay
+    dark_room_penalty: float = 40.0      # Penalty for silence / repetition
+    repeat_tolerance: int = 3            # Consecutive identical replies
+    num_obs_buckets: int = 64            # Hash buckets for obs index
+    top_k: int = 15                      # TopK nodes for comprehension
+    activation_spike_strength: float = 2.0  # Injection strength per token
+    cooccurrence_window: int = 2         # Bigram/trigram window for edges
+
+# ──────────────────────────────────────────────────────────────────────
+# 1c. POLICY LAYER — Sparse Bayesian Competitive Policy
+# ──────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class PolicyConfig:
+    """Parameters for the Dirichlet-based text generation policy."""
+    dirichlet_prior: float = 1.0         # Symmetric Dirichlet for bigrams
+    max_response_len: int = 25           # Hard cap on generated tokens
+    eos_prior_boost: float = 1.5         # EOS prior mass encourages brevity
+    policy_omega: float = 0.95           # Localised forgetting rate
+    policy_eta: float = 1.0              # Learning rate for bigram counts
+    feedback_strength: float = 2.0       # Type-I / Type-II adjustment
 
 # ──────────────────────────────────────────────────────────────────────
 # 2. ACTIVE INFERENCE
@@ -132,6 +167,8 @@ class ExperimentConfig:
 @dataclass(frozen=True)
 class Config:
     grid: GridConfig = field(default_factory=GridConfig)
+    chat: ChatConfig = field(default_factory=ChatConfig)
+    policy: PolicyConfig = field(default_factory=PolicyConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     tsetlin: TsetlinConfig = field(default_factory=TsetlinConfig)
