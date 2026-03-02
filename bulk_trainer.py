@@ -303,7 +303,7 @@ def train_on_corpus(
         # Periodic checkpoint
         if checkpoint_interval > 0 and (cycle + 1) % checkpoint_interval == 0:
             if save_path:
-                save_agent_state(agent, save_path)
+                save_agent_state(agent, env, filepath=save_path)
                 if verbose:
                     print(f"  [checkpoint saved → {save_path}]")
 
@@ -411,7 +411,7 @@ def main() -> None:
     # Load checkpoint if requested
     if args.load and checkpoint_exists(args.load):
         state = load_agent_state(args.load)
-        restore_agent_state(agent, state)
+        restore_agent_state(agent, env, checkpoint=state)
         if not args.quiet:
             print(f"Loaded agent state from {args.load}")
 
@@ -462,7 +462,7 @@ def main() -> None:
 
     # Final save
     if args.save:
-        save_agent_state(agent, args.save)
+        save_agent_state(agent, env, filepath=args.save)
         if not args.quiet:
             print(f"\nAgent state saved → {args.save}")
 
