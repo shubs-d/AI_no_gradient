@@ -187,6 +187,3 @@ This is a local experimental research agent. Validate behavior before using in p
 
 ---
 
-## 11) License
-
-Add your preferred license file if you plan to share/publicly distribute this repository.
