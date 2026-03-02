@@ -9,6 +9,32 @@ No neural networks, no gradients — all computations are:
   • Thompson sampling       (Bayesian action selection),
   • Integer / float ops     on sparse structures.
 
+v3 — Logic-Based Grammar Induction
+───────────────────────────────────
+The policy layer now extracts **syntactic context features** from the
+tokens generated so far and feeds them to the Tsetlin Machine as
+auxiliary input literals.  The TM's Include/Exclude decisions for these
+grammatical features bias word selection toward syntactically coherent
+continuations:
+
+    Syntactic features  (binary, 12-bit default):
+      bit 0  has_subject       — ≥1 noun/pronoun preceded the verb
+      bit 1  has_verb          — ≥1 verb token generated so far
+      bit 2  has_object        — ≥1 noun/pronoun after the verb
+      bit 3  sentence_start    — current position is first token
+      bit 4  after_determiner  — previous token was a/the/this/…
+      bit 5  after_preposition — previous token was in/on/at/…
+      bit 6  after_verb        — previous token was a verb
+      bit 7  after_noun        — previous token was a noun
+      bit 8  is_plural_ctx     — last noun ended in 's'/'es'
+      bit 9  past_tense_ctx    — last verb ended in 'ed'
+      bit 10 progressive_ctx   — last verb ended in 'ing'
+      bit 11 position_late     — generated ≥ 3 tokens already
+
+These features let the TM learn propositional grammar rules like:
+    IF has_subject ∧ ¬has_verb ∧ after_noun → favour VERBS
+    IF has_verb ∧ ¬has_object → favour NOUNS/PRONOUNS
+
 Architecture overview
 ─────────────────────
 1.  **Input:** The TopK most-activated word nodes from the Lyapunov-stable
@@ -31,17 +57,22 @@ Architecture overview
     activated nodes compete, making generation O(K) per token rather
     than O(V) over the full vocabulary.
 
-4.  **Sentence termination:**  A special <EOS> node competes with word
+4.  **Grammar-biased selection:**  Before argmax, θ is modulated by
+    the Tsetlin Machine's output for the current syntactic context
+    features, boosting candidates whose grammatical role matches the
+    TM's Include decision.
+
+5.  **Sentence termination:**  A special <EOS> node competes with word
     nodes.  When <EOS> wins the Thompson sample, generation stops.
     The anti-dark-room penalty in the environment ensures the agent
     doesn't learn to always select <EOS> immediately.
 
-5.  **Caregiver feedback integration:**
+6.  **Caregiver feedback integration:**
     - Positive feedback (Type I) → *strengthen* the Dirichlet counts
       for every bigram transition in the agent's last response.
     - Negative feedback (Type II) → *weaken* those counts.
 
-6.  **Dirichlet forgetting:**
+7.  **Dirichlet forgetting:**
         T_{t+1}[w_i, :] = ω · T_t[w_i, :] + η · evidence
     with ω applied *only* to the active sub-graph rows (localised
     forgetting) so that basic grammar isn't catastrophically erased
@@ -52,6 +83,7 @@ Complexity
   Per-token generation: O(K)  where K = TopK active nodes.
   Per-turn feedback:    O(R)  where R = response length.
   Per-turn forgetting:  O(K²) over the active sub-graph only.
+  Grammar features:     O(1) per token (fixed 12-bit vector).
   No matrix inversions, no backpropagation.
 """
 
@@ -61,6 +93,15 @@ from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
+
+from agent.memory_graph import (
+    _AUXILIARIES,
+    _DETERMINERS,
+    _PREPOSITIONS,
+    _PRONOUNS,
+    _is_likely_noun,
+    _is_likely_verb,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -72,14 +113,173 @@ BOS_TOKEN: str = "<BOS>"       # Beginning-of-sentence marker
 UNK_TOKEN: str = "<UNK>"       # Placeholder for truly unknown nodes
 
 # ── Refractory Period ─────────────────────────────────────────────────
-# Biological synapses have a ~1-3 ms refractory period during which
-# they cannot re-fire.  We mimic this by tracking the last N generated
-# node IDs and multiplying their Thompson-sample probability by a
-# severe suppression factor.  This prevents the pathological "looping"
-# behaviour (e.g., "good good good good") by forcing the agent to
-# traverse *different* edges in the lexical graph.
 REFRACTORY_WINDOW: int        = 3      # Track last 3 tokens
 REFRACTORY_SUPPRESSION: float = 0.01   # Multiply prob by 1% if refractory
+
+# ── Syntactic Feature Indices ─────────────────────────────────────────
+NUM_SYNTACTIC_FEATURES: int = 12
+SF_HAS_SUBJECT:      int = 0
+SF_HAS_VERB:         int = 1
+SF_HAS_OBJECT:       int = 2
+SF_SENTENCE_START:   int = 3
+SF_AFTER_DETERMINER: int = 4
+SF_AFTER_PREPOSITION:int = 5
+SF_AFTER_VERB:       int = 6
+SF_AFTER_NOUN:       int = 7
+SF_IS_PLURAL_CTX:    int = 8
+SF_PAST_TENSE_CTX:   int = 9
+SF_PROGRESSIVE_CTX:  int = 10
+SF_POSITION_LATE:    int = 11
+
+
+def build_syntactic_features(
+    tokens_so_far: List[str],
+) -> np.ndarray:
+    """
+    Construct a binary syntactic feature vector from the tokens
+    generated so far in the current response.
+
+    This is a pure function (no side effects, no external state)
+    that maps a partial token sequence to a 12-bit representation
+    of its grammatical context.
+
+    Parameters
+    ----------
+    tokens_so_far : List[str]
+        Lowercased tokens generated so far in this response turn.
+
+    Returns
+    -------
+    features : ndarray of shape (NUM_SYNTACTIC_FEATURES,), dtype int8
+        Binary feature vector (0 or 1 per slot).
+    """
+    feat = np.zeros(NUM_SYNTACTIC_FEATURES, dtype=np.int8)
+
+    if not tokens_so_far:
+        feat[SF_SENTENCE_START] = 1
+        return feat
+
+    # Track SVO state by scanning tokens
+    found_verb = False
+    found_subject_before_verb = False
+    found_object_after_verb = False
+    last_noun: Optional[str] = None
+    last_verb: Optional[str] = None
+
+    for w in tokens_so_far:
+        wl = w.lower()
+        if not found_verb:
+            if wl in _PRONOUNS or _is_likely_noun(wl):
+                found_subject_before_verb = True
+                last_noun = wl
+            if _is_likely_verb(wl):
+                found_verb = True
+                last_verb = wl
+        else:
+            # After verb — look for object
+            if wl in _PRONOUNS or _is_likely_noun(wl):
+                found_object_after_verb = True
+                last_noun = wl
+            if _is_likely_verb(wl):
+                last_verb = wl
+
+    feat[SF_HAS_SUBJECT] = int(found_subject_before_verb)
+    feat[SF_HAS_VERB] = int(found_verb)
+    feat[SF_HAS_OBJECT] = int(found_object_after_verb)
+
+    # Previous-token features
+    prev = tokens_so_far[-1].lower()
+    feat[SF_AFTER_DETERMINER] = int(prev in _DETERMINERS)
+    feat[SF_AFTER_PREPOSITION] = int(prev in _PREPOSITIONS)
+    feat[SF_AFTER_VERB] = int(_is_likely_verb(prev))
+    feat[SF_AFTER_NOUN] = int(prev not in _DETERMINERS
+                              and prev not in _PREPOSITIONS
+                              and not _is_likely_verb(prev)
+                              and prev not in _AUXILIARIES
+                              and _is_likely_noun(prev))
+
+    # Morphological context
+    if last_noun and last_noun.endswith(("s", "es")):
+        feat[SF_IS_PLURAL_CTX] = 1
+    if last_verb and last_verb.endswith("ed"):
+        feat[SF_PAST_TENSE_CTX] = 1
+    if last_verb and last_verb.endswith("ing"):
+        feat[SF_PROGRESSIVE_CTX] = 1
+
+    # Position feature
+    if len(tokens_so_far) >= 3:
+        feat[SF_POSITION_LATE] = 1
+
+    return feat
+
+
+def grammar_role_boost(
+    word: str,
+    syntactic_features: np.ndarray,
+    role_boost_subject: float = 2.0,
+    role_boost_predicate: float = 1.8,
+    role_boost_object: float = 1.5,
+) -> float:
+    """
+    Compute a multiplicative grammar boost for a candidate word
+    based on the current syntactic context.
+
+    Logic rules (manually-engineered priors, later refined by TM):
+      - If context needs a verb (has_subject, no verb yet) → boost verbs
+      - If context needs an object (has verb, no object) → boost nouns
+      - If after determiner → boost nouns
+      - If after preposition → boost nouns
+      - If sentence start → boost determiners/pronouns/nouns slightly
+
+    Parameters
+    ----------
+    word : str
+        Candidate word (lowercased).
+    syntactic_features : ndarray (NUM_SYNTACTIC_FEATURES,)
+        Current syntactic context features.
+    role_boost_subject, role_boost_predicate, role_boost_object : float
+        Multiplicative boosts for grammatical role matching.
+
+    Returns
+    -------
+    boost : float ≥ 1.0
+        Multiplicative boost (1.0 = no change).
+    """
+    boost = 1.0
+    wl = word.lower()
+
+    has_subj = bool(syntactic_features[SF_HAS_SUBJECT])
+    has_verb = bool(syntactic_features[SF_HAS_VERB])
+    has_obj = bool(syntactic_features[SF_HAS_OBJECT])
+    after_det = bool(syntactic_features[SF_AFTER_DETERMINER])
+    after_prep = bool(syntactic_features[SF_AFTER_PREPOSITION])
+    sent_start = bool(syntactic_features[SF_SENTENCE_START])
+
+    is_verb = _is_likely_verb(wl)
+    is_noun_or_pron = (wl in _PRONOUNS or _is_likely_noun(wl))
+    is_det = (wl in _DETERMINERS)
+
+    # Rule 1: Need a verb → boost verbs
+    if has_subj and not has_verb and is_verb:
+        boost *= role_boost_predicate
+
+    # Rule 2: Need an object → boost nouns/pronouns
+    if has_verb and not has_obj and is_noun_or_pron:
+        boost *= role_boost_object
+
+    # Rule 3: After determiner → boost nouns strongly
+    if after_det and is_noun_or_pron:
+        boost *= role_boost_subject
+
+    # Rule 4: After preposition → boost nouns
+    if after_prep and is_noun_or_pron:
+        boost *= role_boost_object
+
+    # Rule 5: Sentence start → slightly boost determiners & pronouns
+    if sent_start and (is_det or wl in _PRONOUNS):
+        boost *= 1.3
+
+    return boost
 
 
 class SBCPolicy:
@@ -182,6 +382,10 @@ class SBCPolicy:
         top_k_ids: List[int],
         node_labels: Dict[int, str],
         activation_scores: Optional[Dict[int, float]] = None,
+        grammar_boost: bool = True,
+        role_boost_subject: float = 2.0,
+        role_boost_predicate: float = 1.8,
+        role_boost_object: float = 1.5,
     ) -> List[str]:
         """
         Generate a response token sequence using Dirichlet Thompson
@@ -196,6 +400,10 @@ class SBCPolicy:
         4.  Draw  θ ~ Dir(α)  — a Thompson sample.
         5.  Optionally weight θ by activation scores (nodes with higher
             spreading-activation contribute more).
+        5b. Apply refractory suppression (Inhibition of Return).
+        5c. Apply grammar-role boost: build syntactic features from
+            tokens generated so far, then boost candidates whose
+            grammatical role matches the predicted context slot.
         6.  Select  w_next = argmax(θ · activation_weight).
         7.  If w_next == <EOS>  or  length ≥ max_response_len, stop.
         8.  Otherwise append w_next and repeat.
@@ -210,6 +418,10 @@ class SBCPolicy:
         activation_scores : Dict[int, float], optional
             Mapping from node ID → activation level.  If provided,
             Thompson-sampled probabilities are scaled by activation.
+        grammar_boost : bool
+            If True, apply syntactic grammar-role boosting each step.
+        role_boost_subject, role_boost_predicate, role_boost_object : float
+            Multiplicative boosts for grammatical role matches.
 
         Returns
         -------
@@ -276,6 +488,29 @@ class SBCPolicy:
             r_sum = theta.sum()
             if r_sum > 1e-30:
                 theta /= r_sum
+
+            # ── Step 5c: Grammar-role boost (syntactic guidance) ──────
+            # Build the 12-bit syntactic feature vector from what has
+            # been generated so far, then boost each candidate according
+            # to whether its POS matches the predicted context slot.
+            if grammar_boost:
+                syn_feat = build_syntactic_features(tokens)
+                for gi, cid in enumerate(candidates):
+                    if cid == self.eos_id:
+                        continue
+                    label_g = node_labels.get(cid, "")
+                    if label_g and label_g not in (EOS_TOKEN, BOS_TOKEN, UNK_TOKEN):
+                        gb = grammar_role_boost(
+                            label_g, syn_feat,
+                            role_boost_subject=role_boost_subject,
+                            role_boost_predicate=role_boost_predicate,
+                            role_boost_object=role_boost_object,
+                        )
+                        theta[gi] *= gb
+                # Re-normalise after grammar boost
+                gb_sum = theta.sum()
+                if gb_sum > 1e-30:
+                    theta /= gb_sum
 
             # ── Step 6: Select next word ──────────────────────────────
             next_idx = int(np.argmax(theta))
@@ -446,3 +681,23 @@ class SBCPolicy:
         row = self._bigram[src]
         sorted_items = sorted(row.items(), key=lambda x: x[1], reverse=True)
         return sorted_items[:k]
+
+    # ── Grammar feature accessors ─────────────────────────────────────
+
+    def get_syntactic_features_for_context(
+        self,
+        tokens_so_far: List[str],
+    ) -> np.ndarray:
+        """
+        Build the syntactic feature vector for an arbitrary token
+        context.  Thin wrapper around module-level ``build_syntactic_features``.
+
+        Parameters
+        ----------
+        tokens_so_far : List[str]
+
+        Returns
+        -------
+        ndarray of shape (NUM_SYNTACTIC_FEATURES,), dtype int8
+        """
+        return build_syntactic_features(tokens_so_far)

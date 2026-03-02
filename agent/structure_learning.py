@@ -9,6 +9,18 @@ Two-timescale structural adaptation:
     when accumulated surprise warrants it; Bayesian Model Reduction (BMR)
     prunes dead-weight via the Minimum Description Length (MDL) principle.
 
+v3 — Edge-Level MDL Pruning
+────────────────────────────
+  In addition to node-level and clause-level pruning, the structure
+  learner now evaluates *individual edges* for MDL cost-benefit:
+
+      bit_cost(i,j)  = log2(raw_count + 1)
+      vfe_benefit    ≈ count / total_outgoing(i)
+
+  Edges below ``edge_min_count`` or ``edge_vfe_benefit_thresh`` are
+  removed.  Semantic triplet edges (S→P, P→O) receive a ×2 benefit
+  multiplier to protect structured knowledge from aggressive pruning.
+
 NLP Chatbot Extension (v2)
 ──────────────────────────
   • **Unknown-word BME** — When the user inputs a completely unrecognised
@@ -186,6 +198,85 @@ class StructureLearner:
                         report["clauses_reset"] += 1
 
         return report
+
+    def mdl_prune_edges(
+        self,
+        memory_graph,      # MemoryGraph  (avoid circular import)
+        recent_vfe: float, # current avg VFE (proxy for error bits)
+    ) -> dict:
+        """
+        Edge-level MDL pruning: remove graph edges whose description-
+        length cost exceeds their contribution to VFE reduction.
+
+        Algorithm
+        ---------
+        For every directed edge (i → j) with raw count > 0:
+
+            bit_cost(i,j) = log2(count + 1)              … encoding cost
+            vfe_benefit    ≈ count / total_outgoing(i)    … fractional usage
+
+        Pruning rules:
+          • count < edge_min_count → remove (too rare to be useful)
+          • vfe_benefit < edge_vfe_benefit_thresh → remove (marginal
+            contribution to prediction accuracy)
+          • Protected: edges in _edge_types (semantic triplet links)
+            get a ×2 benefit multiplier (harder to prune).
+
+        Parameters
+        ----------
+        memory_graph : MemoryGraph
+        recent_vfe : float
+
+        Returns
+        -------
+        report : dict with 'edges_pruned' count.
+        """
+        cfg = self.cfg
+        report = {"edges_pruned": 0}
+        n = memory_graph.num_nodes
+        raw = memory_graph._raw_counts
+
+        for i in range(n):
+            row_total = int(raw[i, :n].sum())
+            if row_total == 0:
+                continue
+            for j in range(n):
+                count = int(raw[i, j])
+                if count == 0:
+                    continue
+
+                # Rule 1: count too low
+                if count < cfg.edge_min_count:
+                    # Check if this is a protected triplet edge
+                    if hasattr(memory_graph, '_edge_types') and (i, j) in memory_graph._edge_types:
+                        continue  # spare semantic triplet links
+                    raw[i, j] = 0
+                    report["edges_pruned"] += 1
+                    continue
+
+                # Rule 2: marginal VFE benefit too low
+                benefit = count / row_total
+                # Triplet edges get 2× benefit multiplier (harder to prune)
+                if hasattr(memory_graph, '_edge_types') and (i, j) in memory_graph._edge_types:
+                    benefit *= 2.0
+                if benefit < cfg.edge_vfe_benefit_thresh:
+                    raw[i, j] = 0
+                    report["edges_pruned"] += 1
+
+        # Re-normalise after bulk pruning
+        if report["edges_pruned"] > 0:
+            memory_graph.normalize_edges()
+
+        return report
+
+    def should_prune_edges(self) -> bool:
+        """
+        True every ``edge_mdl_interval`` steps if MDL is enabled.
+        """
+        if not self.cfg.mdl_enabled:
+            return False
+        return (self._step > 0
+                and self._step % self.cfg.edge_mdl_interval == 0)
 
     # ── Complexity metrics ────────────────────────────────────────────
 

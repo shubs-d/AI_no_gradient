@@ -27,10 +27,12 @@ import numpy as np
 
 from config import Config, NUM_ACTIONS
 from agent.active_inference import ActiveInferenceEngine
-from agent.memory_graph import MemoryGraph
+from agent.memory_graph import MemoryGraph, extract_triplets
 from agent.tsetlin_logic import TsetlinMachine
 from agent.structure_learning import StructureLearner
-from agent.policy_layer import SBCPolicy, EOS_TOKEN, BOS_TOKEN
+from agent.policy_layer import (
+    SBCPolicy, EOS_TOKEN, BOS_TOKEN, build_syntactic_features,
+)
 
 
 class CognitiveAgent:
@@ -267,6 +269,14 @@ class CognitiveAgent:
             window=chat_cfg.cooccurrence_window,
         )
 
+        # ── 1b. TRIPLET EXTRACTION: learn semantic S→P→O links ───────
+        user_text = " ".join(tokens)
+        grammar_cfg = self.cfg.grammar
+        triplet_ids = self.memory.learn_triplets_from_text(
+            user_text,
+            strength=grammar_cfg.triplet_edge_strength,
+        )
+
         # ── 2. INFER: update beliefs ─────────────────────────────────
         # Ensure obs_idx fits the observation space
         if obs_idx >= self.inference.num_obs:
@@ -312,6 +322,10 @@ class CognitiveAgent:
             top_k_ids=top_k_ids,
             node_labels=node_labels,
             activation_scores=activation_scores,
+            grammar_boost=True,
+            role_boost_subject=grammar_cfg.role_boost_subject,
+            role_boost_predicate=grammar_cfg.role_boost_predicate,
+            role_boost_object=grammar_cfg.role_boost_object,
         )
 
         # ── 6. LEARN: update Dirichlet counts ────────────────────────
@@ -346,12 +360,17 @@ class CognitiveAgent:
         # 6d. Structure learning (VFE accumulation + BME/BMR)
         self.structure.record_vfe(vfe)
 
-        # Tsetlin Machine binary-feature update
+        # Tsetlin Machine binary-feature update (with grammar features)
         binary_features = self.memory.get_binary_features(
             self.cfg.tsetlin.num_literals
         )
         ai_action = self.inference.select_action()
-        self.tsetlin.update(binary_features, target_action=ai_action, vfe=vfe)
+        # Build syntactic features from the response tokens for TM learning
+        syn_feat = build_syntactic_features(response_tokens)
+        self.tsetlin.update_with_grammar(
+            binary_features, syn_feat,
+            target_action=ai_action, vfe=vfe,
+        )
 
         # General BME (from cumulative VFE)
         if self.structure.should_expand():
@@ -379,6 +398,12 @@ class CognitiveAgent:
                 self.memory, self.tsetlin, recent_vfe=vfe
             )
 
+        # Edge-level MDL pruning (separate, less frequent cadence)
+        if self.structure.should_prune_edges():
+            self.structure.mdl_prune_edges(
+                self.memory, recent_vfe=vfe
+            )
+
         # ── Bookkeeping ──────────────────────────────────────────────
         self._prev_state = cur_state
         self._prev_action = ai_action
@@ -404,4 +429,5 @@ class CognitiveAgent:
             ),
             "tsetlin_int_ops": self.tsetlin.int_ops,
             "bigram_entries": self.policy.total_bigram_entries(),
+            "triplet_count": self.memory.triplet_count,
         }

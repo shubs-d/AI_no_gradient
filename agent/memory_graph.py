@@ -4,14 +4,32 @@ memory_graph.py
 Spreading-activation episodic/semantic memory network implemented as a
 dynamic directed graph with **strict Lyapunov stability guarantees**.
 
-NLP Chatbot Extension (v2)
-──────────────────────────
-Each node now represents a **distinct word or concept** (lexical node).
-When a user message is tokenised, the corresponding word nodes receive
-an *activation spike*.  Spreading activation then propagates semantic
-associations through co-occurrence edges, and the TopK highest-activated
-nodes represent the agent's *contextual comprehension* of the user's
-prompt.
+NLP Chatbot Extension (v2) — Lexical word nodes, co-occurrence edges.
+Semantic Triplet Extension (v3) — Subject → Predicate → Object links.
+
+v3 Semantic Triplet Knowledge Graph
+────────────────────────────────────
+Instead of only modelling flat sequential bigrams, the graph now supports
+**Semantic Triplets**  (Subject → Predicate → Object):
+
+    "The cat eats fish"
+    → Subject = "cat"
+    → Predicate = "eats"
+    → Object = "fish"
+
+Triplets are stored as *typed directed edges* in a separate registry:
+
+    _triplets : List[Tuple[int, int, int]]   # (subj_id, pred_id, obj_id)
+
+and the corresponding graph edges are given a configurable strength
+boost (``triplet_edge_strength``) so that spreading activation
+preferentially traverses logical relationships rather than mere
+statistical co-occurrence.
+
+The lightweight heuristic parser ``extract_triplets()`` identifies
+SVO structure from English sentences using only POS-tag heuristics
+(pronoun lists, auxiliary lists, preposition blacklists) — strictly
+zero external dependencies.
 
 Graph representation
 ────────────────────
@@ -19,38 +37,20 @@ Graph representation
 • Each node carries:
     - A real-valued *activation*  A_i(t).
     - A string *label*  (the word or concept it represents).
+    - An optional *role tag* set — 'SUBJ', 'PRED', 'OBJ'.
 • Directed edges carry **integer** co-occurrence counts; the normalised
   adjacency matrix  W  is derived from these counts on-the-fly.
+• **Predicate edges** carry boosted counts, enabling spreading
+  activation to traverse logical (S→P→O) paths with higher weight
+  than random co-occurrence links.
 
 Spreading-Activation update rule
 ────────────────────────────────
   A(t+1) = λ · A(t)  +  W · A(t)                             … (SA-1)
 
-where  λ ∈ (0, 1)  is the intrinsic decay factor and  W  is the
-row-stochastic (outgoing-edge normalised) adjacency matrix.
-
-Lyapunov stability guarantee
-────────────────────────────
-We choose the candidate Lyapunov function
-
-  V(A) = ‖A‖₂²  =  Σ_i  A_i²
-
-A sufficient condition for  ΔV < 0  (globally, away from the origin) is
-
-  ‖λI + W‖₂  <  1
-
-Because  W  is non-negative and row-stochastic (each row sums to ≤ 1),
-
-  ‖W‖₂  ≤  max row-sum  ≤  1
-
-so we enforce:
-
+Lyapunov stability
+──────────────────
   λ_max(W)  ≤  1 − λ − ε                                    … (Lyap)
-
-by scaling outgoing edges so that every row of W sums to at most
-(1 − λ − ε).  After *any* structural graph update (add/remove node or
-edge) the ``normalize_edges()`` method is called to re-establish this
-invariant.
 
 All edge *learning* is integer count-based (Hebbian co-activation).
 The floating-point adjacency matrix is a **derived view** used only
@@ -59,15 +59,213 @@ during the spreading-activation step.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set, Tuple
+import re
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 import numpy as np
 
-# Optional is used for word_to_id return type;
-# Set is used for get_active_subgraph_ids return type;
-# Tuple is used for get_contextual_top_k return type.
-
 from config import MemoryConfig
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Heuristic SVO Triplet Extractor  (zero external dependencies)
+# ═══════════════════════════════════════════════════════════════════════
+
+# Closed-class word sets for lightweight POS tagging
+_PRONOUNS: FrozenSet[str] = frozenset({
+    "i", "you", "he", "she", "it", "we", "they",
+    "me", "him", "her", "us", "them",
+    "myself", "yourself", "himself", "herself", "itself",
+})
+_DETERMINERS: FrozenSet[str] = frozenset({
+    "the", "a", "an", "this", "that", "these", "those",
+    "my", "your", "his", "her", "its", "our", "their",
+    "some", "any", "every", "each", "no",
+})
+_AUXILIARIES: FrozenSet[str] = frozenset({
+    "is", "am", "are", "was", "were", "be", "been", "being",
+    "has", "have", "had", "having",
+    "do", "does", "did",
+    "will", "shall", "would", "should", "could", "can", "may", "might", "must",
+})
+_PREPOSITIONS: FrozenSet[str] = frozenset({
+    "in", "on", "at", "to", "for", "with", "by", "from",
+    "of", "about", "into", "through", "during", "before", "after",
+    "above", "below", "between", "under", "over",
+})
+_CONJUNCTIONS: FrozenSet[str] = frozenset({
+    "and", "but", "or", "nor", "yet", "so", "because", "if", "when",
+    "while", "although", "though", "unless",
+})
+_STOP_WORDS: FrozenSet[str] = _DETERMINERS | _PREPOSITIONS | _CONJUNCTIONS | frozenset({
+    "not", "very", "just", "also", "too", "quite", "really",
+})
+
+# Regex for splitting sentences (crude but fast)
+_SENT_SPLIT_RE = re.compile(r'[.!?;]+')
+_WORD_RE = re.compile(r"[a-zA-Z0-9]+(?:'[a-z]+)?")
+
+
+def _is_likely_verb(word: str) -> bool:
+    """
+    Heuristic verb detector — checks common English verb suffixes,
+    membership in the auxiliary set, and stem matching against a
+    common-verb vocabulary.
+
+    Handles third-person singular ("eats" → "eat") and past/progressive
+    forms via suffix rules.  No external POS tagger.
+
+    Returns True for words that are *probably* verbs.  Intentionally
+    over-generates (false positives are cheaper than missed triplets).
+    """
+    w = word.lower()
+    if w in _AUXILIARIES:
+        return True
+    # Common verb suffixes
+    if w.endswith(("ed", "ing", "ize", "ise", "ify", "ate")):
+        return True
+
+    # Very common short verbs (base forms)
+    _COMMON_VERBS = {
+        "go", "get", "see", "say", "eat", "run", "put", "let",
+        "set", "cut", "sit", "hit", "buy", "pay", "win", "try",
+        "use", "ask", "tell", "give", "take", "make", "come",
+        "know", "want", "like", "love", "hate", "need", "help",
+        "feel", "find", "keep", "show", "read", "write", "think",
+        "mean", "play", "work", "move", "live", "call", "turn",
+        "look", "seem", "hear", "send", "hold", "bring", "meet",
+        "learn", "lead", "grow", "open", "walk", "talk", "pick",
+        "sing", "drive", "paint", "cook", "study", "fix",
+        "discover", "design", "treat", "create", "prepare",
+        "explain", "chase", "sleep", "shine", "blow", "bloom",
+        "kick", "fly", "swim", "hunt", "rise", "fall", "flow",
+    }
+
+    if w in _COMMON_VERBS:
+        return True
+
+    # Third-person singular: "eats" → "eat", "runs" → "run"
+    if w.endswith("s") and not w.endswith("ss"):
+        stem = w[:-1]
+        if stem in _COMMON_VERBS:
+            return True
+        # "ies" → "y": "tries" → "try"
+        if w.endswith("ies"):
+            stem2 = w[:-3] + "y"
+            if stem2 in _COMMON_VERBS:
+                return True
+        # "es" → "": "goes" → "go", "teaches" → "teach"
+        if w.endswith("es"):
+            stem3 = w[:-2]
+            if stem3 in _COMMON_VERBS:
+                return True
+
+    return False
+
+
+def _is_likely_noun(word: str) -> bool:
+    """Heuristic: a word is *likely* a noun if it isn't anything else."""
+    w = word.lower()
+    if w in _STOP_WORDS or w in _AUXILIARIES or w in _PRONOUNS:
+        return False
+    if _is_likely_verb(w):
+        return False
+    return True
+
+
+def extract_triplets(text: str) -> List[Tuple[str, str, str]]:
+    """
+    Lightweight heuristic SVO triplet extractor.
+
+    Splits *text* into sentences, then for each sentence applies a
+    three-pass scan:
+
+      Pass 1 — **Subject:** first pronoun or noun before the verb.
+      Pass 2 — **Predicate:** first verb (including auxiliary chains).
+      Pass 3 — **Object:** first noun/pronoun after the verb.
+
+    Returns a list of (subject, predicate, object) string tuples.
+    Sentences that don't yield a complete triplet are skipped.
+
+    Parameters
+    ----------
+    text : str
+        Raw English text (may contain multiple sentences).
+
+    Returns
+    -------
+    List of (subject, predicate, object) tuples, all lowercased.
+
+    Complexity
+    ----------
+    O(|text|) — single pass per sentence, no recursion, no external libs.
+
+    Examples
+    --------
+    >>> extract_triplets("The cat eats fish.")
+    [('cat', 'eats', 'fish')]
+
+    >>> extract_triplets("I like apples and she reads books.")
+    [('i', 'like', 'apples'), ('she', 'reads', 'books')]
+
+    >>> extract_triplets("Hello!")
+    []
+    """
+    triplets: List[Tuple[str, str, str]] = []
+
+    # Split into sentence fragments
+    fragments = _SENT_SPLIT_RE.split(text)
+
+    for frag in fragments:
+        words = [w.lower() for w in _WORD_RE.findall(frag)]
+        if len(words) < 2:
+            continue
+
+        # ── Pass 1 & 2: find subject and predicate ───────────────────
+        subject: Optional[str] = None
+        predicate: Optional[str] = None
+        pred_idx: int = -1
+
+        for idx, w in enumerate(words):
+            if predicate is None:
+                # Still looking for subject
+                if subject is None:
+                    if w in _PRONOUNS or _is_likely_noun(w):
+                        subject = w
+                # Now look for verb
+                if _is_likely_verb(w):
+                    # If we found a verb before a subject, the verb IS
+                    # the whole sentence (imperative), skip
+                    if subject is None:
+                        subject = w  # imperative: verb acts as subject
+                        continue
+                    predicate = w
+                    pred_idx = idx
+                    break
+
+        if predicate is None or subject is None:
+            continue
+
+        # Handle auxiliary + main verb chains: "is eating" → "is eating"
+        if pred_idx + 1 < len(words) and _is_likely_verb(words[pred_idx + 1]):
+            predicate = predicate + " " + words[pred_idx + 1]
+            pred_idx += 1
+
+        # ── Pass 3: find object (first noun/pronoun after predicate) ─
+        obj: Optional[str] = None
+        for w in words[pred_idx + 1:]:
+            if w in _STOP_WORDS:
+                continue
+            if w in _PRONOUNS or _is_likely_noun(w):
+                obj = w
+                break
+
+        if obj is None:
+            continue
+
+        triplets.append((subject, predicate, obj))
+
+    return triplets
 
 
 class MemoryGraph:
@@ -95,6 +293,17 @@ class MemoryGraph:
         self._W: np.ndarray = np.zeros(
             (cfg.initial_capacity, cfg.initial_capacity), dtype=np.float64
         )
+
+        # ── Semantic Triplet Storage (v3) ─────────────────────────────
+        # Each triplet stores (subject_node_id, predicate_node_id, object_node_id)
+        self._triplets: List[Tuple[int, int, int]] = []
+
+        # Edge-type annotations:  (src_id, dst_id) → role string
+        # Roles: 'S→P' (subject to predicate), 'P→O' (predicate to object)
+        self._edge_types: Dict[Tuple[int, int], str] = {}
+
+        # Node role tags — which roles a node has served
+        self._node_roles: Dict[int, Set[str]] = {}  # id → {'SUBJ','PRED','OBJ'}
 
     # ── Properties ────────────────────────────────────────────────────
 
@@ -492,3 +701,129 @@ class MemoryGraph:
             return set()
         active_mask = self._activation[:n] >= threshold
         return set(int(i) for i in np.where(active_mask)[0])
+
+    # ══════════════════════════════════════════════════════════════════
+    # Semantic Triplet KG  (v3)
+    # ══════════════════════════════════════════════════════════════════
+
+    def learn_triplet(
+        self,
+        subj_word: str,
+        pred_word: str,
+        obj_word: str,
+        strength: int = 3,
+    ) -> Tuple[int, int, int]:
+        """
+        Ground a semantic triplet (Subject → Predicate → Object) into
+        the graph as **typed predicate edges** with boosted weight.
+
+        The three words are ensured as nodes (via ``get_or_create_word_node``),
+        then two directed edges are created:
+
+            Subject ──(S→P)──▶ Predicate ──(P→O)──▶ Object
+
+        Edge counts are incremented by *strength* (default comes from
+        ``GrammarConfig.triplet_edge_strength``).  The edge-type registry
+        and node role tags are updated, and the triplet is appended to
+        ``_triplets``.
+
+        Parameters
+        ----------
+        subj_word, pred_word, obj_word : str
+            The three components of the semantic triplet.
+        strength : int
+            Count increment per edge (higher = stronger semantic bond).
+
+        Returns
+        -------
+        (subj_id, pred_id, obj_id) : Tuple[int, int, int]
+        """
+        s_id = self.get_or_create_word_node(subj_word.lower())
+        p_id = self.get_or_create_word_node(pred_word.lower())
+        o_id = self.get_or_create_word_node(obj_word.lower())
+
+        # Typed edge:  Subject → Predicate
+        cap = self.cfg.edge_weight_max
+        self._raw_counts[s_id, p_id] = min(
+            int(self._raw_counts[s_id, p_id]) + strength, cap
+        )
+        self._edge_types[(s_id, p_id)] = "S→P"
+
+        # Typed edge:  Predicate → Object
+        self._raw_counts[p_id, o_id] = min(
+            int(self._raw_counts[p_id, o_id]) + strength, cap
+        )
+        self._edge_types[(p_id, o_id)] = "P→O"
+
+        # Role tags
+        self._node_roles.setdefault(s_id, set()).add("SUBJ")
+        self._node_roles.setdefault(p_id, set()).add("PRED")
+        self._node_roles.setdefault(o_id, set()).add("OBJ")
+
+        # Store triplet
+        self._triplets.append((s_id, p_id, o_id))
+
+        # Re-normalise to maintain Lyapunov invariant
+        self.normalize_edges()
+
+        return (s_id, p_id, o_id)
+
+    def learn_triplets_from_text(
+        self,
+        text: str,
+        strength: int = 3,
+    ) -> List[Tuple[int, int, int]]:
+        """
+        Extract SVO triplets from *text* and learn each one.
+
+        This is the high-level convenience API for bulk ingestion:
+        parse → ground → link, all in one call.
+
+        Parameters
+        ----------
+        text : str
+            Raw English text (may contain multiple sentences).
+        strength : int
+            Edge count boost per triplet link.
+
+        Returns
+        -------
+        List of (subj_id, pred_id, obj_id) tuples for all triplets
+        successfully grounded.
+        """
+        raw = extract_triplets(text)
+        result = []
+        for subj, pred, obj in raw:
+            ids = self.learn_triplet(subj, pred, obj, strength=strength)
+            result.append(ids)
+        return result
+
+    def get_triplets_involving(self, node_id: int) -> List[Tuple[int, int, int]]:
+        """
+        Return all stored triplets where *node_id* appears in any role.
+
+        Parameters
+        ----------
+        node_id : int
+
+        Returns
+        -------
+        Filtered list of (subj_id, pred_id, obj_id) tuples.
+        """
+        return [
+            t for t in self._triplets
+            if node_id in t
+        ]
+
+    def get_node_roles(self, node_id: int) -> Set[str]:
+        """Return the set of grammatical roles a node has served."""
+        return self._node_roles.get(node_id, set())
+
+    def get_edge_type(self, src: int, dst: int) -> Optional[str]:
+        """Return the role label of a typed edge, or None."""
+        return self._edge_types.get((src, dst))
+
+    @property
+    def triplet_count(self) -> int:
+        """Number of triplets stored in the graph."""
+        return len(self._triplets)

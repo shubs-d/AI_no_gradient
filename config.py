@@ -141,10 +141,14 @@ class StructureConfig:
     expansion_cooldown: int = 5          # Min steps between consecutive BME
     max_ai_states: int = 48              # Cap AI hidden-state dimension
     mdl_eval_interval: int = 100         # Steps between BMR pruning sweeps
-    mdl_enabled: bool = False            # ★ MDL DISABLED for stress test
+    mdl_enabled: bool = True             # ★ MDL ENABLED for v3 scaling
     min_node_visits: int = 3             # Prune nodes visited fewer times
     merge_similarity_thresh: float = 0.9 # Cosine-like overlap for node merging
     clause_usage_min: int = 5            # Prune clauses used fewer times
+    # ── MDL edge pruning (v3) ─────────────────────────────────────
+    edge_mdl_interval: int = 200         # Steps between edge-MDL sweeps
+    edge_min_count: int = 2              # Prune edges with count < this
+    edge_vfe_benefit_thresh: float = 0.1 # Marginal VFE benefit to keep edge
 
 # ──────────────────────────────────────────────────────────────────────
 # 6. EXPERIMENT
@@ -164,6 +168,20 @@ class ExperimentConfig:
 # 7. AGGREGATE CONFIG  (single import for convenience)
 # ──────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────
+# 7a. GRAMMAR INDUCTION via Tsetlin Machine  (v3)
+# ──────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class GrammarConfig:
+    """Parameters for logic-based grammar induction."""
+    num_syntactic_features: int = 12     # Binary features encoding POS/tense
+    role_boost_subject: float = 2.0      # Activation boost for subject nodes
+    role_boost_object: float = 1.5       # Activation boost for object nodes
+    role_boost_predicate: float = 1.8    # Activation boost for predicate nodes
+    triplet_edge_strength: int = 3       # Initial edge weight for triplet links
+
+
 @dataclass(frozen=True)
 class Config:
     grid: GridConfig = field(default_factory=GridConfig)
@@ -174,6 +192,7 @@ class Config:
     tsetlin: TsetlinConfig = field(default_factory=TsetlinConfig)
     structure: StructureConfig = field(default_factory=StructureConfig)
     experiment: ExperimentConfig = field(default_factory=ExperimentConfig)
+    grammar: GrammarConfig = field(default_factory=GrammarConfig)
 
 
 # Default global instance – importable everywhere

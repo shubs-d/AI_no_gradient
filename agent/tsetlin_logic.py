@@ -4,6 +4,23 @@ tsetlin_logic.py
 Decentralised Tsetlin Machine for learning state-action policies from
 binary features produced by the spreading-activation memory graph.
 
+v3 — Grammar Feature Literals
+──────────────────────────────
+The literal space is now partitioned into two regions:
+
+    [ memory-graph binary features  |  syntactic context features ]
+    [         L_graph bits          |   L_syntax bits (12 default) ]
+
+The TM learns propositional rules that jointly condition on *what*
+words are active (graph features) and *where in the sentence structure*
+we are (syntactic features):
+
+    IF cat_active ∧ has_subject ∧ ¬has_verb → vote for "verb" pathway
+    IF ate_active ∧ has_verb ∧ ¬has_object → vote for "noun" pathway
+
+The ``combine_features()`` utility concatenates graph + syntax vectors
+into the unified input that ``_evaluate_all_clauses`` operates on.
+
 Design principles
 ─────────────────
 • **No gradients.**  All updates are integer increments/decrements on
@@ -12,7 +29,8 @@ Design principles
   active-inference prediction error (surprise), NOT by external reward.
 • **Embarrassingly parallel.**  Clause evaluations are fully decoupled;
   the complexity is  O(C × L)  where C = clauses, L = literals.
-• **Binary literals** come from ``MemoryGraph.get_binary_features()``.
+• **Binary literals** come from ``MemoryGraph.get_binary_features()``
+  concatenated with ``build_syntactic_features()`` from the policy layer.
 
 Architecture (per action class)
 ───────────────────────────────
@@ -42,6 +60,9 @@ from __future__ import annotations
 import numpy as np
 
 from config import TsetlinConfig, NUM_ACTIONS
+
+# Number of syntactic feature bits appended to graph features
+NUM_SYNTAX_BITS: int = 12
 
 
 class TsetlinMachine:
@@ -376,3 +397,82 @@ class TsetlinMachine:
             self.clause_usage = self.clause_usage[:, :C_old]
 
         self._ta = new_ta
+
+    # ── Grammar-aware feature utilities ───────────────────────────────
+
+    @staticmethod
+    def combine_features(
+        graph_features: np.ndarray,
+        syntactic_features: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Concatenate memory-graph binary features with syntactic context
+        features into a single input vector for clause evaluation.
+
+        Parameters
+        ----------
+        graph_features : ndarray of shape (L_graph,), dtype int8
+            Binary activation features from the spreading-activation
+            graph (via ``MemoryGraph.get_binary_features()``).
+        syntactic_features : ndarray of shape (L_syntax,), dtype int8
+            Binary syntactic context features from
+            ``build_syntactic_features()`` (default 12 bits).
+
+        Returns
+        -------
+        combined : ndarray of shape (L_graph + L_syntax,), dtype int8
+            Unified literal input for the TM.
+        """
+        return np.concatenate([graph_features, syntactic_features]).astype(np.int8)
+
+    def vote_with_grammar(
+        self,
+        graph_features: np.ndarray,
+        syntactic_features: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Compute action votes using combined graph + syntax features.
+
+        This is the primary interface for grammar-aware action selection.
+        The TM will learn clauses that condition on both *lexical context*
+        (which words are active) and *syntactic context* (sentence
+        structure so far).
+
+        If the combined feature vector is longer than the current literal
+        space, the TM is automatically expanded via ``expand_literals()``.
+
+        Parameters
+        ----------
+        graph_features : ndarray of shape (L_graph,), int8
+        syntactic_features : ndarray of shape (L_syntax,), int8
+
+        Returns
+        -------
+        votes : ndarray of shape (num_actions,), int64
+        """
+        x = self.combine_features(graph_features, syntactic_features)
+        if len(x) > self.current_num_literals:
+            self.expand_literals(len(x))
+        return self.vote(x)
+
+    def update_with_grammar(
+        self,
+        graph_features: np.ndarray,
+        syntactic_features: np.ndarray,
+        target_action: int,
+        vfe: float,
+    ) -> None:
+        """
+        Apply VFE-driven feedback using combined graph + syntax features.
+
+        Parameters
+        ----------
+        graph_features : ndarray of shape (L_graph,), int8
+        syntactic_features : ndarray of shape (L_syntax,), int8
+        target_action : int
+        vfe : float
+        """
+        x = self.combine_features(graph_features, syntactic_features)
+        if len(x) > self.current_num_literals:
+            self.expand_literals(len(x))
+        self.update(x, target_action, vfe)
