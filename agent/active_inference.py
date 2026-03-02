@@ -1,0 +1,344 @@
+"""
+active_inference.py
+===================
+Discrete Active Inference engine built entirely on Dirichlet concentration
+counts – no gradient descent, no floating-point weight matrices.
+
+Generative model
+────────────────
+The agent maintains two categorical-Dirichlet tables:
+
+  B[s, a, s']  –  transition counts   P(s' | s, a)
+  A[s, o]      –  likelihood counts    P(o | s)
+
+Expected log-probabilities are computed via the digamma (ψ) function:
+
+  E[ln A] = ψ(a) − ψ(a₀)   where a₀ = Σ_j a_j        … (Eq. 1)
+
+Dirichlet Forgetting  (STRESS-TEST)
+───────────────────
+To prevent count contamination from stale regimes:
+
+  θ_{t+1} = ω · θ_t  +  η · χ_t                          … (Forget)
+
+where ω = 0.95 (decay) and η = 1.0 (learning rate).
+
+Preference Prior C  (anti-Dark-Room)
+────────────────────
+The EFE pragmatic term uses an inflated log-preference vector C(o)
+with an extreme boost for CELL_RESOURCE, mathematically compelling
+the agent to seek resource states over hiding.
+
+Variational Free Energy (VFE)
+─────────────────────────────
+  F  =  E_q[ ln q(s) − ln P(o, s) ]
+     ≈  KL[ q(s) ‖ P(s) ] − E_q[ ln P(o | s) ]
+
+Because q(s) is updated by Bayesian belief updating (count increments),
+VFE reduces to the *prediction error* (surprise) at each step.
+
+Expected Free Energy (EFE)
+──────────────────────────
+  G(π) = Σ_τ  [ −epistemic − pragmatic ]
+  epistemic   = H[ P(o | s) ]            (expected information gain)
+  pragmatic   = E_q[ ln P(o | preferred) ] (goal-seeking term)
+
+All arrays are integer counts updated via the forgetting equation.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from scipy.special import digamma
+
+from config import InferenceConfig, NUM_ACTIONS, CELL_RESOURCE
+
+
+class ActiveInferenceEngine:
+    """Discrete active-inference module using Dirichlet count tables."""
+
+    # ── Construction ──────────────────────────────────────────────────
+
+    def __init__(self, num_states: int, cfg: InferenceConfig) -> None:
+        """
+        Parameters
+        ----------
+        num_states : int
+            Number of *hidden* states the agent distinguishes.
+            This can grow at runtime via structure learning.
+        cfg : InferenceConfig
+            Hyper-parameters (prior, horizon, weights …).
+        """
+        self.cfg = cfg
+        self.num_states = num_states
+        self.num_obs = cfg.num_obs_symbols
+        self.num_actions = NUM_ACTIONS
+
+        # ── Dirichlet count tables (integer + prior) ──────────────
+        # A[s, o] : likelihood counts  →  P(o | s)
+        self._A = np.full(
+            (num_states, self.num_obs),
+            cfg.dirichlet_prior,
+            dtype=np.float64,          # counts are logically integers;
+        )                               # we keep float for digamma convenience
+
+        # B[s, a, s'] : transition counts →  P(s' | s, a)
+        self._B = np.full(
+            (num_states, self.num_actions, num_states),
+            cfg.dirichlet_prior,
+            dtype=np.float64,
+        )
+
+        # Current posterior belief over hidden states  q(s)
+        self._qs = np.ones(num_states, dtype=np.float64) / num_states
+
+        # Running VFE for the structure-learning module to inspect
+        self.last_vfe: float = 0.0
+
+        # ── Preference prior C(o):  inflated log-preference vector ───
+        # C[o] = 0 for non-preferred obs, large positive for resource.
+        # This enters EFE pragmatic = Σ_{s'} q(s') Σ_o P(o|s') C(o).
+        self._C = np.zeros(self.num_obs, dtype=np.float64)
+        self._C[cfg.preferred_obs] = cfg.consume_preference_boost
+
+    # ── Properties for external read access ───────────────────────────
+
+    @property
+    def A(self) -> np.ndarray:
+        """Likelihood count matrix  A[s, o]."""
+        return self._A
+
+    @property
+    def B(self) -> np.ndarray:
+        """Transition count tensor  B[s, a, s']."""
+        return self._B
+
+    @property
+    def belief(self) -> np.ndarray:
+        """Current posterior  q(s)."""
+        return self._qs
+
+    # ── Dirichlet expected log-probabilities (Eq. 1) ──────────────────
+
+    @staticmethod
+    def _expected_log(counts: np.ndarray, axis: int = -1) -> np.ndarray:
+        """
+        Compute  E[ln Cat] = ψ(a_j) − ψ(Σ_j a_j)  along *axis*.
+
+        Parameters
+        ----------
+        counts : ndarray
+            Dirichlet concentration parameters (≥ prior > 0).
+        axis : int
+            Summation axis for a₀.
+
+        Returns
+        -------
+        ndarray of same shape as *counts*.
+        """
+        a0 = counts.sum(axis=axis, keepdims=True)
+        return digamma(counts) - digamma(a0)
+
+    # ── Belief update (state estimation) ──────────────────────────────
+
+    def update_belief(self, obs_idx: int) -> float:
+        """
+        Bayesian belief update given a new observation.
+
+        1.  Compute likelihood  ln P(o | s)  from Dirichlet counts.
+        2.  Combine with prior  ln q(s)  (previous posterior).
+        3.  Normalise to obtain updated  q(s).
+        4.  Return scalar VFE (negative log-evidence ≈ surprise).
+
+        Parameters
+        ----------
+        obs_idx : int
+            Index of the observed cell type.
+
+        Returns
+        -------
+        vfe : float
+            Variational Free Energy for this time-step.
+        """
+        # Expected log-likelihood  E[ln P(o|s)]  for every state
+        ln_A = self._expected_log(self._A, axis=1)          # shape (S, O)
+        ln_lik = ln_A[:, obs_idx]                            # shape (S,)
+
+        # Log prior = current posterior (message passing)
+        ln_prior = np.log(self._qs + 1e-16)
+
+        # Unnormalised log posterior
+        ln_post = ln_lik + ln_prior
+        ln_post -= ln_post.max()                             # numerical stability
+        qs_new = np.exp(ln_post)
+        qs_new /= qs_new.sum()
+
+        # ── VFE = KL[q‖prior] − E_q[ln P(o|s)]  ≈  surprise ────────
+        kl = np.sum(qs_new * (np.log(qs_new + 1e-16) - ln_prior))
+        expected_ll = np.dot(qs_new, ln_lik)
+        vfe = float(kl - expected_ll)
+
+        self._qs = qs_new
+        self.last_vfe = vfe
+        return vfe
+
+    # ── Count updates (learning by counting) ──────────────────────────
+
+    def update_counts(
+        self,
+        prev_state: int,
+        action: int,
+        next_state: int,
+        obs_idx: int,
+    ) -> None:
+        """
+        Update Dirichlet counts with **forgetting**:
+
+            θ_{t+1}  =  ω · θ_t  +  η · χ_t
+
+        where χ_t is a one-hot evidence vector for the observed
+        transition, ω is the decay rate, and η is the learning rate.
+
+        This prevents the categorical distributions from becoming
+        permanently rigid due to historical count contamination.
+        """
+        omega = self.cfg.dirichlet_decay_omega    # 0.95
+        eta   = self.cfg.dirichlet_learning_rate  # 1.0
+        prior = self.cfg.dirichlet_prior
+
+        # ── Decay ALL counts toward the prior, then inject evidence ──
+        # B[prev_state, action, :] *= ω  then += η at next_state
+        self._B[prev_state, action, :] *= omega
+        self._B[prev_state, action, next_state] += eta
+        # Floor at prior to avoid degenerate zero-counts
+        np.maximum(self._B[prev_state, action, :], prior,
+                   out=self._B[prev_state, action, :])
+
+        # A[next_state, :] *= ω  then += η at obs_idx
+        self._A[next_state, :] *= omega
+        self._A[next_state, obs_idx] += eta
+        np.maximum(self._A[next_state, :], prior,
+                   out=self._A[next_state, :])
+
+    # ── Action selection via Expected Free Energy (EFE) ───────────────
+
+    def select_action(self) -> int:
+        """
+        One-step Expected Free Energy action selection.
+
+        G(a) = − epistemic(a) − pragmatic(a)
+
+        epistemic(a) = Σ_s' q(s') H[P(o | s')]      (info-gain proxy)
+        pragmatic(a) = Σ_s' q(s') E[ln P(o_pref | s')]
+
+        Returns the action that **minimises** G  (i.e., maximises
+        negative free energy = epistemic value + pragmatic value).
+        """
+        cfg = self.cfg
+        G = np.zeros(self.num_actions, dtype=np.float64)
+
+        # Transition probabilities  P(s'|s,a)  from Dirichlet counts
+        ln_B = self._expected_log(self._B, axis=2)     # (S, A, S')
+
+        # Expected log-likelihood matrix  E[ln P(o|s)]
+        ln_A = self._expected_log(self._A, axis=1)     # (S, O)
+
+        for a in range(self.num_actions):
+            # Expected next-state distribution under current belief
+            # q(s') = Σ_s q(s) P(s'|s,a)
+            transition_probs = np.exp(ln_B[:, a, :])            # (S, S')
+            transition_probs /= transition_probs.sum(axis=1, keepdims=True) + 1e-16
+            qs_next = self._qs @ transition_probs                # (S',)
+            qs_next /= qs_next.sum() + 1e-16
+
+            # ── Epistemic value: expected entropy of observations ────
+            #    H[P(o|s')] for each s', weighted by q(s')
+            A_probs = self._A / self._A.sum(axis=1, keepdims=True)
+            entropy_per_state = -np.sum(
+                A_probs * np.log(A_probs + 1e-16), axis=1
+            )                                                     # (S,)
+            epistemic = float(np.dot(qs_next, entropy_per_state))
+
+            # ── Pragmatic value: E_{q(s')}[ Σ_o P(o|s') C(o) ] ────
+            # Uses the inflated preference vector C instead of just
+            # a single preferred-obs log-probability.
+            pragmatic_per_state = A_probs @ self._C               # (S,)
+            pragmatic = float(np.dot(qs_next, pragmatic_per_state))
+
+            G[a] = -(cfg.efe_epistemic_weight * epistemic
+                     + cfg.efe_pragmatic_weight * pragmatic)
+
+        # Select action that *minimises* G  (argmin of neg values = argmax value)
+        best_action = int(np.argmin(G))
+        return best_action
+
+    # ── Structural growth helpers ─────────────────────────────────────
+
+    def expand_state_space(self, new_num_states: int) -> None:
+        """
+        Grow Dirichlet count tables when structure learning adds nodes.
+
+        New rows / slices are initialised to the symmetric prior so they
+        carry no empirical information until the agent visits them.
+        """
+        old = self.num_states
+        if new_num_states <= old:
+            return
+
+        delta = new_num_states - old
+        prior = self.cfg.dirichlet_prior
+
+        # Expand A  (S, O)
+        new_A = np.full((delta, self.num_obs), prior, dtype=np.float64)
+        self._A = np.concatenate([self._A, new_A], axis=0)
+
+        # Expand B  (S, A, S')  along both state axes
+        # First add new "from" states
+        new_B_rows = np.full(
+            (delta, self.num_actions, old), prior, dtype=np.float64
+        )
+        self._B = np.concatenate([self._B, new_B_rows], axis=0)
+        # Then add new "to" states for ALL rows
+        new_B_cols = np.full(
+            (new_num_states, self.num_actions, delta), prior, dtype=np.float64
+        )
+        self._B = np.concatenate([self._B, new_B_cols], axis=2)
+
+        # Expand belief vector
+        new_qs = np.zeros(delta, dtype=np.float64)
+        self._qs = np.concatenate([self._qs, new_qs])
+        self._qs /= self._qs.sum() + 1e-16
+
+        self.num_states = new_num_states
+
+    def shrink_state_space(self, keep_mask: np.ndarray) -> None:
+        """
+        Remove states flagged False in *keep_mask* (BMR pruning).
+
+        Parameters
+        ----------
+        keep_mask : bool array of shape (num_states,)
+        """
+        self._A = self._A[keep_mask]
+        self._B = self._B[keep_mask][:, :, keep_mask]
+        self._qs = self._qs[keep_mask]
+        self._qs /= self._qs.sum() + 1e-16
+        self.num_states = int(keep_mask.sum())
+
+    # ── Utilities ─────────────────────────────────────────────────────
+
+    def get_surprise(self, obs_idx: int) -> float:
+        """
+        Point-wise surprise  −ln P(o)  under the *current* generative model,
+        marginalised over states.
+
+        Useful for the structure-learning trigger.
+        """
+        # P(o) ≈ Σ_s q(s) P(o|s)
+        A_probs = self._A / self._A.sum(axis=1, keepdims=True)
+        p_o = float(np.dot(self._qs, A_probs[:, obs_idx]))
+        return -np.log(p_o + 1e-16)
+
+    def most_likely_state(self) -> int:
+        """MAP estimate of the current hidden state."""
+        return int(np.argmax(self._qs))
